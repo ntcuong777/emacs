@@ -3098,6 +3098,11 @@ tarballs and prepare them to be activated in the sub-process.
 *** package-x.el is now obsolete.
 
 ---
+*** The command 'package-vc-install-from-checkout' is now obsolete.
+Please use the User Lisp directory instead.  This also means that
+combining the 'use-package' keywords ':vc' and ':load-path' is obsolete.
+
+---
 *** Package menu now highlights packages marked for installation or deletion.
 
 *** Package menu now displays the total number of the package type.
@@ -3757,6 +3762,14 @@ the mode line without polling for changes every
 'battery-update-interval' seconds.  Setting this user option to nil
 means the mode line will update only when the battery power state,
 percentage, or presence in the bay changes.
+
+** Etags Regen mode
+
+*** Tags table is not created during completion anymore.
+Previously, when there was no tags table loaded and the default
+completion function was called, 'etags-regen-mode' ensured that tags
+were created.  This has been disabled, and the new user option
+'etags-regen-create-on-completion' can be used to enable it again.
 
 
 * New Modes and Packages in Emacs 31.1
