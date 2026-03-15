@@ -2066,7 +2066,7 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 
 #ifdef HAVE_NS
   /* For early calls to ns_lisp_to_color or Fns_list_colors.  */
-  if (!dump_mode)
+  if (!dump_mode && !noninteractive)
     ns_init_colors ();
 
   if (!noninteractive)
