@@ -3154,9 +3154,13 @@ mouse_get_xy (int *x, int *y)
   struct frame *sf = SELECTED_FRAME ();
   if (f == sf || frame_ancestor_p (sf, f))
     {
-      int mx = XFIXNUM (XCAR (XCDR (mouse)));
-      int my = XFIXNUM (XCDR (XCDR (mouse)));
-      root_xy (f, mx, my, x, y);
+      Lisp_Object lmx = XCAR (XCDR (mouse)), lmy = XCDR (XCDR (mouse));
+      if (FIXNUMP (lmx) && FIXNUMP (lmy))
+	{
+	  int mx = XFIXNUM (lmx);
+	  int my = XFIXNUM (lmy);
+	  root_xy (f, mx, my, x, y);
+	}
     }
 }
 
@@ -3892,7 +3896,7 @@ tty_menu_show (struct frame *f, int x, int y, int menuflags,
   if (menu_items_n_panes == 0)
     return Qnil;
 
-  if (menu_items_used <= MENU_ITEMS_PANE_LENGTH)
+  if (menu_items_used <= MENU_ITEMS_PANE_LENGTH || !VECTORP (menu_items))
     {
       *error_name = "Empty menu";
       return Qnil;
