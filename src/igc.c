@@ -5007,6 +5007,20 @@ igc_free_global_ref (struct module_global_reference *r)
 }
 #endif
 
+#ifdef HAVE_XWIDGETS
+void
+igc_unpin_xwidget (struct xwidget *xw)
+{
+  unpin (global_igc, xw, xw->pin_index);
+}
+
+void
+igc_unpin_xwidget_view (struct xwidget_view *xv)
+{
+  unpin (global_igc, xv, xv->pin_index);
+}
+#endif
+
 Lisp_Object
 igc_make_cons (Lisp_Object car, Lisp_Object cdr)
 {
@@ -5091,6 +5105,32 @@ igc_alloc_pseudovector (size_t nwords_mem, size_t nwords_lisp,
       v = alloc_immovable (size, IGC_OBJ_VECTOR);
       ((struct thread_state *) v)->pin_index = pin (global_igc, v);
     }
+#ifdef HAVE_XWIDGETS
+  else if (tag == PVEC_XWIDGET || tag == PVEC_XWIDGET_VIEW)
+    {
+      /* Alloc xwidgets immovable because both toolkit backends
+	 store raw struct xwidget pointers outside MPS-traced memory:
+
+	 NS (macOS): The Objective-C XwWebView holds a raw pointer
+	 via @property struct xwidget *xw that MPS cannot trace.
+	 WebKit delegate callbacks (didFinishNavigation: etc.)
+	 dereference this pointer.
+
+	 GTK: g_object_set_data() stashes a raw pointer in the
+	 GObject widget (keyed by XG_XWIDGET).  GTK signal handlers
+	 retrieve it via g_object_get_data() in callbacks like
+	 webkit_view_load_changed_cb.
+
+	 In both cases, if MPS moves the xwidget struct, these
+	 external pointers become stale and callbacks dereference
+	 freed/reused memory.  See doc/igc-xwidget-crash.md.  */
+      v = alloc_immovable (size, IGC_OBJ_VECTOR);
+      if (tag == PVEC_XWIDGET)
+	((struct xwidget *) v)->pin_index = pin (global_igc, v);
+      else
+	((struct xwidget_view *) v)->pin_index = pin (global_igc, v);
+    }
+#endif
   else
     v = alloc (size, IGC_OBJ_VECTOR);
   XSETPVECTYPESIZE (v, tag, nwords_lisp, nwords_mem - nwords_lisp);

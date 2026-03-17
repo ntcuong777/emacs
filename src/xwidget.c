@@ -32,6 +32,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "termhooks.h"
 #include "window.h"
 #include "process.h"
+#ifdef HAVE_MPS
+#include "igc.h"
+#endif
 
 /* Include xwidget bottom end headers.  */
 #ifdef USE_GTK
@@ -3424,6 +3427,11 @@ DEFUN ("delete-xwidget-view",
 
   internal_xwidget_view_list = Fdelq (xwidget_view, internal_xwidget_view_list);
   Vxwidget_view_list = Fcopy_sequence (internal_xwidget_view_list);
+
+#ifdef HAVE_MPS
+  igc_unpin_xwidget_view (xv);
+#endif
+
   unblock_input ();
   return Qnil;
 }
@@ -4260,6 +4268,12 @@ kill_xwidget (struct xwidget *xw)
   catch_child_signal ();
 #elif defined NS_IMPL_COCOA
   nsxwidget_kill (xw);
+#endif
+
+#ifdef HAVE_MPS
+  /* Unpin so MPS can collect the xwidget now that all toolkit
+     resources (and their raw pointers to this struct) are gone.  */
+  igc_unpin_xwidget (xw);
 #endif
 }
 

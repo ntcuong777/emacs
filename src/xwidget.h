@@ -97,6 +97,13 @@ struct xwidget
 
   /* Kill silently if Emacs is exited.  */
   bool_bf kill_without_query : 1;
+
+#ifdef HAVE_MPS
+  /* Index into IGC pin registry.  Xwidgets must be pinned (immovable)
+     because both NS and GTK backends store raw struct pointers in
+     memory not traced by MPS.  See doc/igc-xwidget-crash.md.  */
+  ptrdiff_t pin_index;
+#endif
 } GCALIGNED_STRUCT;
 
 struct xwidget_view
@@ -152,6 +159,11 @@ struct xwidget_view
   int clip_left;
 
   long handler_id;
+
+#ifdef HAVE_MPS
+  /* Index into IGC pin registry.  See struct xwidget comment.  */
+  ptrdiff_t pin_index;
+#endif
 } GCALIGNED_STRUCT;
 #endif
 

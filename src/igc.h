@@ -49,6 +49,12 @@ Lisp_Object igc_alloc_symbol (void);
 void *igc_alloc_global_ref (void);
 void igc_free_global_ref (struct module_global_reference *ref);
 #endif
+#ifdef HAVE_XWIDGETS
+struct xwidget;
+struct xwidget_view;
+void igc_unpin_xwidget (struct xwidget *xw);
+void igc_unpin_xwidget_view (struct xwidget_view *xv);
+#endif
 
 struct Lisp_Buffer_Local_Value *igc_alloc_blv (void);
 void *igc_alloc_handler (void);
