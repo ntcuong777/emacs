@@ -169,7 +169,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # ifndef HASH_Lisp_Mutex_744F44A86D
 #  error "struct Lisp_Mutex changed"
 # endif
-# ifndef HASH_coding_system_77D58F21B9
+# ifndef HASH_coding_system_719F6B8D2B
 #  error "struct coding_system changed"
 # endif
 # ifndef HASH_terminal_19777CD1E0
@@ -190,7 +190,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>. */
 # ifndef HASH_itree_tree_A8CE87B78A
 #  error "struct itree_tree changed"
 # endif
-# ifndef HASH_image_7243288625
+# ifndef HASH_image_5576A094B1
 #  error "struct image changed"
 # endif
 # ifndef HASH_image_cache_3EC6F9D296
@@ -1855,7 +1855,7 @@ scan_hash_table_user_test (mps_ss_t ss, void *start, void *end, void *closure)
   return MPS_RES_OK;
 }
 
-#ifdef USE_GTK
+#if defined (USE_GTK) && ! defined (HAVE_PGTK)
 /* scan_xg_pending_quit_event assumes that the fields of the input_event
    are in a consistent state.  This is a relatively safe assumption
    because:
@@ -2024,26 +2024,6 @@ fix_face (mps_ss_t ss, struct face *f)
 #if defined HAVE_XFT || defined HAVE_FREETYPE
     IGC_FIX12_HEADER (ss, (struct vectorlike_header **) &f->extra);
 #endif
-  }
-  MPS_SCAN_END (ss);
-  return MPS_RES_OK;
-}
-
-static mps_res_t
-fix_face_cache (mps_ss_t ss, struct face_cache *c)
-{
-  MPS_SCAN_BEGIN (ss)
-  {
-    IGC_FIX12_PVEC (ss, &c->f);
-
-    if (c->faces_by_id)
-      for (ptrdiff_t i = 0; i < c->used; ++i)
-	IGC_FIX12_RAW (ss, &c->faces_by_id[i]);
-
-    if (c->buckets)
-      for (ptrdiff_t i = 0; i < FACE_CACHE_BUCKETS_SIZE; ++i)
-	if (c->buckets[i])
-	  IGC_FIX12_RAW (ss, &c->buckets[i]);
   }
   MPS_SCAN_END (ss);
   return MPS_RES_OK;
@@ -2540,12 +2520,13 @@ dflt_scan_obj (mps_ss_t ss, mps_addr_t start)
 	   references.  Going back to exact refs would be best.  */
 	break;
 
-      case IGC_OBJ_FACE:
-	IGC_FIX_CALL_FN (ss, struct face, addr, fix_face);
+      case IGC_OBJ_FACE_CACHE:
+	/* FIXME/igc: face caches temporarily changed to use ambiguous
+	   references.  Going back to exact refs would be best.  */
 	break;
 
-      case IGC_OBJ_FACE_CACHE:
-	IGC_FIX_CALL_FN (ss, struct face_cache, addr, fix_face_cache);
+      case IGC_OBJ_FACE:
+	IGC_FIX_CALL_FN (ss, struct face, addr, fix_face);
 	break;
 
       case IGC_OBJ_BLV:
@@ -4105,6 +4086,27 @@ igc_xnrealloc_ambig (void *old_pa, ptrdiff_t nitems, ptrdiff_t item_size)
   igc_xfree (old_pa);
 
   return new_pa;
+}
+
+void *
+igc_xpalloc_raw_exact (void *pa, ptrdiff_t *nitems,
+		       ptrdiff_t nitems_incr_min, ptrdiff_t nitems_max,
+		       const char *label)
+{
+  ptrdiff_t nitems_old = pa ? *nitems : 0;
+  ptrdiff_t nitems_new = nitems_old;
+  ptrdiff_t nbytes
+    = xpalloc_nbytes (pa, &nitems_new, nitems_incr_min, nitems_max,
+		      sizeof (void *));
+  void **old = pa;
+  void **new = xzalloc (nbytes);
+  root_create_exact (global_igc, new, new + nitems_new, scan_ptr_exact, label);
+  for (ptrdiff_t i = 0; i < nitems_old; i++)
+    new[i] = old[i];
+  igc_destroy_root_with_start (old);
+  xfree (old);
+  *nitems = nitems_new;
+  return new;
 }
 
 Lisp_Object *
@@ -5918,6 +5920,7 @@ make_igc (void)
   root_create_exact_ptr (gc, &current_thread);
   root_create_exact_ptr (gc, &all_threads);
   root_create_kbd_buffer (gc);
+  root_create_exact_ptr (gc, &buffer_before_last_command_or_undo);
 #if defined (USE_GTK) && ! defined (HAVE_PGTK)
   root_create_xg_pending_quit_event (gc);
 #endif
