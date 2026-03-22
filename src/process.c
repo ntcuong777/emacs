@@ -469,6 +469,185 @@ static struct fd_callback_data
   struct thread_state *waiting_thread;
 } fd_callback_info[FD_SETSIZE];
 
+#ifdef USE_POLL
+
+/* Convert read, write, and exception sets to the corresponding array
+   of struct pollfd.  NFDS is the upper bound on fd values to scan.
+   PFDS must point to an array with at least NFDS entries.  Returns
+   the number of entries populated.  Any of RSET, WSET, ESET can be
+   NULL, in which case they are treated as empty sets.  */
+
+static int
+fd_sets_to_pollfds (emacs_fd_set *rset, emacs_fd_set *wset,
+		    emacs_fd_set *eset, int nfds,
+		    struct pollfd *pfds)
+{
+  int poll_idx = 0;
+  emacs_fd_set dummy;
+  FD_ZERO (&dummy);
+
+  if (!rset) rset = &dummy;
+  if (!wset) wset = &dummy;
+  if (!eset) eset = &dummy;
+
+  for (int i = 0; i < nfds; i++)
+    {
+      short events = 0;
+      if (FD_ISSET (i, rset))
+	events |= POLLIN;
+      if (FD_ISSET (i, wset))
+	events |= POLLOUT;
+      if (FD_ISSET (i, eset))
+	events |= POLLPRI;
+      if (events != 0)
+	{
+	  pfds[poll_idx].fd = i;
+	  pfds[poll_idx].events = events;
+	  pfds[poll_idx].revents = 0;
+	  poll_idx++;
+	}
+    }
+  return poll_idx;
+}
+
+/* Convert an array of struct pollfd back into read, write, and
+   exception fd_sets.  POLL_COUNT is the number of entries in PFDS.
+   Any of RSET, WSET, ESET can be NULL.
+
+   POLLERR and POLLNVAL are mapped to both read and write sets to
+   match select(2) behavior, where errored fds appear readable and
+   writable so the caller discovers the error on the next I/O call.
+   POLLPRI maps to the exception set.
+
+   Returns the number of bits set across all output sets (matching
+   pselect's return-value contract).  */
+
+static int
+pollfds_to_fd_sets (emacs_fd_set *rset, emacs_fd_set *wset,
+		    emacs_fd_set *eset,
+		    struct pollfd *pfds, int poll_count)
+{
+  int ready = 0;
+  emacs_fd_set dummy;
+
+  if (!rset) rset = &dummy;
+  FD_ZERO (rset);
+  if (!wset) wset = &dummy;
+  FD_ZERO (wset);
+  if (!eset) eset = &dummy;
+  FD_ZERO (eset);
+
+  for (int i = 0; i < poll_count; i++)
+    {
+      short revents = pfds[i].revents;
+      int fd = pfds[i].fd;
+      if (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+	{
+	  FD_SET (fd, rset);
+	  ready++;
+	}
+      if (revents & (POLLOUT | POLLERR | POLLNVAL))
+	{
+	  FD_SET (fd, wset);
+	  ready++;
+	}
+      if (revents & POLLPRI)
+	{
+	  FD_SET (fd, eset);
+	  ready++;
+	}
+    }
+  return ready;
+}
+
+/* Convert a struct timespec to the corresponding timeout in
+   milliseconds.  A NULL timespec is treated as infinity.
+   Clamps to INT_MAX to avoid overflow.  */
+
+int
+timespec_to_timeout (const struct timespec *ts)
+{
+  if (!ts)
+    return -1;
+  /* Guard against overflow: INT_MAX milliseconds is ~24.8 days,
+     which is more than enough for any practical Emacs timeout.  */
+  if (ts->tv_sec > (long)(INT_MAX / 1000))
+    return INT_MAX;
+  return (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+}
+
+/* Wrapper around poll(2) with the calling convention of pselect(2).
+   Converts fd_set arguments to a per-call struct pollfd array and
+   back.  Uses ppoll where available to properly handle the sigmask,
+   preventing signal races (e.g. SIGCHLD during startup).
+
+   The pollfd array is stack-allocated for the common case (<=128 fds
+   monitored) and heap-allocated otherwise.  This makes the function
+   thread-safe -- concurrent calls from the NS fd_handler thread and
+   the main thread each get their own buffer.  */
+int
+emacs_pselect (int nfds, emacs_fd_set *readfds, emacs_fd_set *writefds,
+	       emacs_fd_set *errorfds, const struct timespec *timeout,
+	       const sigset_t *sigmask)
+{
+  int ret, ready;
+  int poll_count;
+  struct pollfd stack_pfds[128];
+  struct pollfd *pfds = stack_pfds;
+  bool heap = false;
+
+  /* nfds is the upper bound on fd values, not the count of fds to
+     monitor, but it bounds how many pollfd entries we might need.  */
+  if (nfds > 128)
+    {
+      pfds = xnmalloc (nfds, sizeof *pfds);
+      heap = true;
+    }
+
+  poll_count = fd_sets_to_pollfds (readfds, writefds, errorfds, nfds, pfds);
+
+#ifdef HAVE_PPOLL
+  /* ppoll accepts a timespec directly and handles the sigmask
+     atomically, matching pselect semantics.  */
+  ret = ppoll (pfds, poll_count, timeout, sigmask);
+#else
+  /* Fallback: bracket poll() with pthread_sigmask to approximate
+     pselect atomicity.  There is a small window between
+     pthread_sigmask and poll where signals can be lost, but this
+     is the best we can do without ppoll.  */
+  sigset_t origmask;
+  if (sigmask)
+    pthread_sigmask (SIG_SETMASK, sigmask, &origmask);
+  ret = poll (pfds, poll_count, timespec_to_timeout (timeout));
+  if (sigmask)
+    pthread_sigmask (SIG_SETMASK, &origmask, NULL);
+#endif
+
+  if (ret > 0)
+    {
+      ready = pollfds_to_fd_sets (readfds, writefds, errorfds,
+				  pfds, poll_count);
+    }
+  else
+    {
+      if (readfds)
+	FD_ZERO (readfds);
+      if (writefds)
+	FD_ZERO (writefds);
+      if (errorfds)
+	FD_ZERO (errorfds);
+      ready = ret;
+    }
+
+  if (heap)
+    xfree (pfds);
+
+  /* pselect returns the total number of bits set across all output
+     sets, not the number of pollfd entries with events.  */
+  return ret < 0 ? ret : ready;
+}
+#endif	/* USE_POLL */
+
 static void
 clear_fd_callback_data (struct fd_callback_data* elem)
 {
@@ -3619,7 +3798,7 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	      if (errno == EINTR)
 		goto retry_select;
 	      else
-		report_file_error ("Failed select", Qnil);
+		report_file_error ("Failed select/poll", Qnil);
 	    }
 	  eassert (sc > 0);
 
