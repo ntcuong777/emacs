@@ -2971,6 +2971,13 @@ internal_equal_1 (Lisp_Object o1, Lisp_Object o2, enum equal_kind equal_kind,
 				  bool_vector_bytes (size)));
 	    }
 
+#ifdef HAVE_MACGUI
+	/* Font-objects, which are subject to equality testing, may
+	   contain save-values in the mac font backends.  */
+	  case PVEC_MISC_PTR:
+	    return xmint_pointer (o1) == xmint_pointer (o2);
+#endif
+
 #ifdef HAVE_TREE_SITTER
 	  case PVEC_TS_NODE:
 	    return treesit_node_eq (o1, o2);

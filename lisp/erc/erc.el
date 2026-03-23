@@ -5459,6 +5459,7 @@ connection or, with -A, all applicable connections.
                                     (defvar gtk-version-string)
                                     (concat ", GTK+ Version "
                                             gtk-version-string))
+                                   ((featurep 'mac) ", Mac")
                                    ((featurep 'x-toolkit) ", X toolkit")
                                    (t ""))
                              (if (and (boundp 'x-toolkit-scroll-bars)

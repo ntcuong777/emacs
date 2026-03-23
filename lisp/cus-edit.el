@@ -423,6 +423,13 @@
   :link '(custom-manual "(emacs)Windows")
   :group 'environment)
 
+(defgroup mac nil
+  "Mac specific features."
+  :link '(custom-manual "(emacs)Mac Port")
+  :group 'environment
+  :version "22.1"
+  :prefix "mac-")
+
 ;;; Custom mode keymaps
 
 (defvar-keymap custom-mode-map
@@ -2276,7 +2283,7 @@ and `face'."
 ;;; The `custom' Widget.
 
 (defface custom-button
-  '((((type x w32 ns haiku pgtk android) (class color)
+  '((((type x w32 mac ns haiku pgtk android) (class color)
       (min-colors 88))	; Like default mode line
      :box (:line-width 2 :style released-button)
      :background "lightgrey" :foreground "black")
@@ -2288,7 +2295,7 @@ and `face'."
   :group 'custom-faces)
 
 (defface custom-button-mouse
-  '((((type x w32 ns haiku pgtk android) (class color)
+  '((((type x w32 mac ns haiku pgtk android) (class color)
       (min-colors 88))
      :box (:line-width 2 :style released-button)
      :background "grey90" :foreground "black")
@@ -2318,7 +2325,7 @@ and `face'."
       (if custom-raised-buttons 'custom-button-mouse 'highlight))
 
 (defface custom-button-pressed
-  '((((type x w32 ns haiku pgtk android) (class color grayscale))
+  '((((type x w32 mac ns haiku pgtk android) (class color grayscale))
      :box (:line-width 2 :style pressed-button)
      :background "lightgrey" :foreground "black")
     (((type x w32 ns haiku pgtk android))
@@ -3654,6 +3661,10 @@ The X11 Window System.")
 					   :sibling-args (:help-echo "\
 MS Windows.")
 					   w32)
+				    (const :format "MAC "
+					   :sibling-args (:help-echo "\
+Mac OS.")
+					   mac)
 				    (const :format "NS "
 					   :sibling-args (:help-echo "\
 GNUstep or Macintosh OS Cocoa interface.")
