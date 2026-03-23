@@ -58,8 +58,8 @@ void igc_unpin_xwidget_view (struct xwidget_view *xv);
 
 struct Lisp_Buffer_Local_Value *igc_alloc_blv (void);
 void *igc_alloc_handler (void);
-void *igc_xzalloc_ambig (size_t size);
-void *igc_xzalloc_ambig_with_label (size_t size, const char *label);
+void *igc_xzalloc_ambig (size_t size, const char *label);
+#define IGC_XZALLOC_AMBIG(size) igc_xzalloc_ambig (size, __func__)
 void *igc_realloc_ambig (void *block, size_t size);
 #ifdef ENABLE_CHECKING
 void igc_check_freeable (void *p);
