@@ -188,6 +188,8 @@ GTK_OBJ=@GTK_OBJ@
 NOTIFY_OBJ = @NOTIFY_OBJ@
 NOTIFY_CFLAGS = @NOTIFY_CFLAGS@
 NOTIFY_LIBS = @NOTIFY_LIBS@
+## fsevents.o if HAVE_FSEVENTS (Objective-C, needs .m handling).
+NOTIFY_OBJC_OBJ = @NOTIFY_OBJC_OBJ@
 
 ## -ltermcap, or -lncurses, or -lcurses, or "".
 LIBS_TERMCAP=@LIBS_TERMCAP@
@@ -471,7 +473,8 @@ base_obj = dispnew.o frame.o scroll.o xdisp.o menu.o $(XMENU_OBJ) window.o     \
 	$(MSDOS_OBJ) $(MSDOS_X_OBJ) $(NS_OBJ) $(CYGWIN_OBJ) $(FONT_OBJ)        \
 	$(W32_OBJ) $(WINDOW_SYSTEM_OBJ) $(XGSELOBJ)			       \
 	$(HAIKU_OBJ) $(PGTK_OBJ) $(ANDROID_OBJ)
-doc_obj = $(base_obj) $(NS_OBJC_OBJ)
+doc_obj = $(base_obj) $(NS_OBJC_OBJ) \
+  $(filter-out $(NOTIFY_OBJ),$(NOTIFY_OBJC_OBJ))
 obj = $(doc_obj) $(HAIKU_CXX_OBJ)
 
 ## Object files used on some machine or other.
@@ -685,7 +688,8 @@ buildobj.h: Makefile
 	done >$@.tmp
 	$(AM_V_at)mv $@.tmp $@
 
-GLOBAL_SOURCES = $(base_obj:.o=.c) $(NS_OBJC_OBJ:.o=.m)
+GLOBAL_SOURCES = $(filter-out $(NOTIFY_OBJC_OBJ:.o=.c), $(base_obj:.o=.c)) \
+  $(NS_OBJC_OBJ:.o=.m) $(NOTIFY_OBJC_OBJ:.o=.m)
 
 gl-stamp: $(libsrc)/make-docfile$(EXEEXT) $(GLOBAL_SOURCES)
 	$(AM_V_GLOBALS)$(libsrc)/make-docfile -d $(srcdir) -g $(doc_obj) > globals.tmp
