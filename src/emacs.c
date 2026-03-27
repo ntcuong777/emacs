@@ -2201,6 +2201,10 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
   globals_of_kqueue ();
 #endif
 
+#ifdef HAVE_FSEVENTS
+  globals_of_fsevents ();
+#endif
+
 #ifdef HAVE_GFILENOTIFY
   globals_of_gfilenotify ();
 #endif
@@ -2525,6 +2529,10 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 #ifdef HAVE_KQUEUE
       syms_of_kqueue ();
 #endif /* HAVE_KQUEUE */
+
+#ifdef HAVE_FSEVENTS
+      syms_of_fsevents ();
+#endif /* HAVE_FSEVENTS */
 
 #ifdef HAVE_GFILENOTIFY
       syms_of_gfilenotify ();
