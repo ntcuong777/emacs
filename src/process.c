@@ -136,7 +136,7 @@ static struct rlimit nofile_limit;
 #endif
 #endif
 
-#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
+#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS || defined HAVE_NS
 /* This is 0.1s in nanoseconds. */
 #define ASYNC_RETRY_NSEC 100000000
 #endif
@@ -152,6 +152,52 @@ extern int sys_select (int, fd_set *, fd_set *, fd_set *,
 #if GNUC_PREREQ (4, 3, 0) && ! GNUC_PREREQ (5, 1, 0)
 # pragma GCC diagnostic ignored "-Wstrict-overflow"
 #endif
+
+#if defined HAVE_NS && !defined HAVE_GETADDRINFO_A
+#include <pthread.h>
+
+/* Async DNS resolution for macOS using pthreads.
+   macOS lacks getaddrinfo_a (GNU libc), so we emulate it with a
+   detached thread that calls getaddrinfo synchronously.  */
+
+enum { DNS_RUNNING = 0, DNS_COMPLETED = 1, DNS_ABANDONED = 2 };
+
+struct ns_dns_request
+{
+  char *hostname;
+  char *servname;
+  struct addrinfo hints;
+  struct addrinfo *ar_result;
+  /* State machine: DNS_RUNNING -> DNS_COMPLETED or DNS_ABANDONED.
+     CAS ensures exactly one transition, so cleanup responsibility
+     is unambiguous even in tight races.  */
+  volatile int state;
+  int gai_error;
+  pthread_t thread;
+};
+
+static void *
+ns_dns_thread_func (void *arg)
+{
+  struct ns_dns_request *req = arg;
+  req->gai_error = getaddrinfo (req->hostname, req->servname,
+				&req->hints, &req->ar_result);
+  /* Try RUNNING -> COMPLETED.  If the main thread already moved to
+     ABANDONED, we lost the CAS race and must self-clean.  */
+  int expected = DNS_RUNNING;
+  if (__atomic_compare_exchange_n (&req->state, &expected, DNS_COMPLETED,
+                                   0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    return NULL;
+
+  /* CAS failed: state is DNS_ABANDONED.  Clean up ourselves.  */
+  if (req->ar_result)
+    freeaddrinfo (req->ar_result);
+  xfree (req->hostname);
+  xfree (req->servname);
+  xfree (req);
+  return NULL;
+}
+#endif /* HAVE_NS && !HAVE_GETADDRINFO_A */
 
 /* True if keyboard input is on hold, zero otherwise.  */
 
@@ -468,6 +514,185 @@ static struct fd_callback_data
      points to the thread.  Otherwise it is NULL.  */
   struct thread_state *waiting_thread;
 } fd_callback_info[FD_SETSIZE];
+
+#ifdef USE_POLL
+
+/* Convert read, write, and exception sets to the corresponding array
+   of struct pollfd.  NFDS is the upper bound on fd values to scan.
+   PFDS must point to an array with at least NFDS entries.  Returns
+   the number of entries populated.  Any of RSET, WSET, ESET can be
+   NULL, in which case they are treated as empty sets.  */
+
+static int
+fd_sets_to_pollfds (emacs_fd_set *rset, emacs_fd_set *wset,
+		    emacs_fd_set *eset, int nfds,
+		    struct pollfd *pfds)
+{
+  int poll_idx = 0;
+  emacs_fd_set dummy;
+  FD_ZERO (&dummy);
+
+  if (!rset) rset = &dummy;
+  if (!wset) wset = &dummy;
+  if (!eset) eset = &dummy;
+
+  for (int i = 0; i < nfds; i++)
+    {
+      short events = 0;
+      if (FD_ISSET (i, rset))
+	events |= POLLIN;
+      if (FD_ISSET (i, wset))
+	events |= POLLOUT;
+      if (FD_ISSET (i, eset))
+	events |= POLLPRI;
+      if (events != 0)
+	{
+	  pfds[poll_idx].fd = i;
+	  pfds[poll_idx].events = events;
+	  pfds[poll_idx].revents = 0;
+	  poll_idx++;
+	}
+    }
+  return poll_idx;
+}
+
+/* Convert an array of struct pollfd back into read, write, and
+   exception fd_sets.  POLL_COUNT is the number of entries in PFDS.
+   Any of RSET, WSET, ESET can be NULL.
+
+   POLLERR and POLLNVAL are mapped to both read and write sets to
+   match select(2) behavior, where errored fds appear readable and
+   writable so the caller discovers the error on the next I/O call.
+   POLLPRI maps to the exception set.
+
+   Returns the number of bits set across all output sets (matching
+   pselect's return-value contract).  */
+
+static int
+pollfds_to_fd_sets (emacs_fd_set *rset, emacs_fd_set *wset,
+		    emacs_fd_set *eset,
+		    struct pollfd *pfds, int poll_count)
+{
+  int ready = 0;
+  emacs_fd_set dummy;
+
+  if (!rset) rset = &dummy;
+  FD_ZERO (rset);
+  if (!wset) wset = &dummy;
+  FD_ZERO (wset);
+  if (!eset) eset = &dummy;
+  FD_ZERO (eset);
+
+  for (int i = 0; i < poll_count; i++)
+    {
+      short revents = pfds[i].revents;
+      int fd = pfds[i].fd;
+      if (revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))
+	{
+	  FD_SET (fd, rset);
+	  ready++;
+	}
+      if (revents & (POLLOUT | POLLERR | POLLNVAL))
+	{
+	  FD_SET (fd, wset);
+	  ready++;
+	}
+      if (revents & POLLPRI)
+	{
+	  FD_SET (fd, eset);
+	  ready++;
+	}
+    }
+  return ready;
+}
+
+/* Convert a struct timespec to the corresponding timeout in
+   milliseconds.  A NULL timespec is treated as infinity.
+   Clamps to INT_MAX to avoid overflow.  */
+
+int
+timespec_to_timeout (const struct timespec *ts)
+{
+  if (!ts)
+    return -1;
+  /* Guard against overflow: INT_MAX milliseconds is ~24.8 days,
+     which is more than enough for any practical Emacs timeout.  */
+  if (ts->tv_sec > (long)(INT_MAX / 1000))
+    return INT_MAX;
+  return (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+}
+
+/* Wrapper around poll(2) with the calling convention of pselect(2).
+   Converts fd_set arguments to a per-call struct pollfd array and
+   back.  Uses ppoll where available to properly handle the sigmask,
+   preventing signal races (e.g. SIGCHLD during startup).
+
+   The pollfd array is stack-allocated for the common case (<=128 fds
+   monitored) and heap-allocated otherwise.  This makes the function
+   thread-safe -- concurrent calls from the NS fd_handler thread and
+   the main thread each get their own buffer.  */
+int
+emacs_pselect (int nfds, emacs_fd_set *readfds, emacs_fd_set *writefds,
+	       emacs_fd_set *errorfds, const struct timespec *timeout,
+	       const sigset_t *sigmask)
+{
+  int ret, ready;
+  int poll_count;
+  struct pollfd stack_pfds[128];
+  struct pollfd *pfds = stack_pfds;
+  bool heap = false;
+
+  /* nfds is the upper bound on fd values, not the count of fds to
+     monitor, but it bounds how many pollfd entries we might need.  */
+  if (nfds > 128)
+    {
+      pfds = xnmalloc (nfds, sizeof *pfds);
+      heap = true;
+    }
+
+  poll_count = fd_sets_to_pollfds (readfds, writefds, errorfds, nfds, pfds);
+
+#ifdef HAVE_PPOLL
+  /* ppoll accepts a timespec directly and handles the sigmask
+     atomically, matching pselect semantics.  */
+  ret = ppoll (pfds, poll_count, timeout, sigmask);
+#else
+  /* Fallback: bracket poll() with pthread_sigmask to approximate
+     pselect atomicity.  There is a small window between
+     pthread_sigmask and poll where signals can be lost, but this
+     is the best we can do without ppoll.  */
+  sigset_t origmask;
+  if (sigmask)
+    pthread_sigmask (SIG_SETMASK, sigmask, &origmask);
+  ret = poll (pfds, poll_count, timespec_to_timeout (timeout));
+  if (sigmask)
+    pthread_sigmask (SIG_SETMASK, &origmask, NULL);
+#endif
+
+  if (ret > 0)
+    {
+      ready = pollfds_to_fd_sets (readfds, writefds, errorfds,
+				  pfds, poll_count);
+    }
+  else
+    {
+      if (readfds)
+	FD_ZERO (readfds);
+      if (writefds)
+	FD_ZERO (writefds);
+      if (errorfds)
+	FD_ZERO (errorfds);
+      ready = ret;
+    }
+
+  if (heap)
+    xfree (pfds);
+
+  /* pselect returns the total number of bits set across all output
+     sets, not the number of pollfd entries with events.  */
+  return ret < 0 ? ret : ready;
+}
+#endif	/* USE_POLL */
 
 static void
 clear_fd_callback_data (struct fd_callback_data* elem)
@@ -991,15 +1216,23 @@ update_processes_for_thread_death (Lisp_Object dying_thread)
     }
 }
 
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
 static void
 free_dns_request (Lisp_Object proc)
 {
   struct Lisp_Process *p = XPROCESS (proc);
 
+#ifdef HAVE_GETADDRINFO_A
   if (p->dns_request->ar_result)
     freeaddrinfo (p->dns_request->ar_result);
   xfree (p->dns_request);
+#else /* HAVE_NS */
+  if (p->dns_request->ar_result)
+    freeaddrinfo (p->dns_request->ar_result);
+  xfree (p->dns_request->hostname);
+  xfree (p->dns_request->servname);
+  xfree (p->dns_request);
+#endif
   p->dns_request = NULL;
 }
 #endif
@@ -1105,9 +1338,10 @@ Interactively, it will kill the current buffer's process.  */)
   process = get_process (process);
   p = XPROCESS (process);
 
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
   if (p->dns_request)
     {
+#ifdef HAVE_GETADDRINFO_A
       /* Cancel the request.  Unless shutting down, wait until
 	 completion.  Free the request if completely canceled. */
 
@@ -1121,6 +1355,36 @@ Interactively, it will kill the current buffer's process.  */)
 	}
       if (canceled)
 	free_dns_request (process);
+#else /* HAVE_NS */
+      /* Wait for the background DNS thread to finish, with a timeout
+         to avoid blocking indefinitely if the resolver stalls.  */
+      {
+        int attempts = 0;
+        while (__atomic_load_n (&p->dns_request->state,
+                                __ATOMIC_ACQUIRE) == DNS_RUNNING
+               && attempts++ < 100)
+          {
+            struct timespec ts = { 0, 10000000 }; /* 10ms */
+            nanosleep (&ts, NULL);
+          }
+        if (__atomic_load_n (&p->dns_request->state,
+                             __ATOMIC_ACQUIRE) == DNS_COMPLETED)
+          free_dns_request (process);
+        else
+          {
+            /* Try RUNNING -> ABANDONED.  If CAS fails, the worker
+               just completed; we take cleanup responsibility.  */
+            int expected = DNS_RUNNING;
+            if (__atomic_compare_exchange_n (&p->dns_request->state,
+                                             &expected, DNS_ABANDONED,
+                                             0, __ATOMIC_ACQ_REL,
+                                             __ATOMIC_ACQUIRE))
+              p->dns_request = NULL;
+            else
+              free_dns_request (process);
+          }
+      }
+#endif
     }
 #endif
 
@@ -3619,7 +3883,7 @@ connect_network_socket (Lisp_Object proc, Lisp_Object addrinfos,
 	      if (errno == EINTR)
 		goto retry_select;
 	      else
-		report_file_error ("Failed select", Qnil);
+		report_file_error ("Failed select/poll", Qnil);
 	    }
 	  eassert (sc > 0);
 
@@ -3986,6 +4250,8 @@ usage: (make-network-process &rest ARGS)  */)
   enum { any_protocol = 0 };
 #ifdef HAVE_GETADDRINFO_A
   struct gaicb *dns_request = NULL;
+#elif defined HAVE_NS
+  struct ns_dns_request *dns_request = NULL;
 #endif
   specpdl_ref count = SPECPDL_INDEX ();
 
@@ -4185,7 +4451,34 @@ usage: (make-network-process &rest ARGS)  */)
 
 	  goto open_socket;
 	}
-#endif /* HAVE_GETADDRINFO_A */
+#elif defined HAVE_NS
+      if (nowait)
+	{
+	  dns_request = xmalloc (sizeof *dns_request);
+	  memset (dns_request, 0, sizeof *dns_request);
+	  dns_request->hostname = xstrdup (SSDATA (host));
+	  dns_request->servname = xstrdup (portstring);
+	  dns_request->hints.ai_family = family;
+	  dns_request->hints.ai_socktype = socktype;
+	  dns_request->ar_result = NULL;
+	  dns_request->state = DNS_RUNNING;
+
+	  pthread_t tid;
+	  int ret = pthread_create (&tid, NULL, ns_dns_thread_func,
+				    dns_request);
+	  if (ret)
+	    {
+	      xfree (dns_request->hostname);
+	      xfree (dns_request->servname);
+	      xfree (dns_request);
+	      error ("Failed to create DNS thread: %s", strerror (ret));
+	    }
+	  pthread_detach (tid);
+	  dns_request->thread = tid;
+
+	  goto open_socket;
+	}
+#endif /* HAVE_GETADDRINFO_A || HAVE_NS */
     }
 
   /* If we have a host, use getaddrinfo to resolve both host and service.
@@ -4282,7 +4575,7 @@ usage: (make-network-process &rest ARGS)  */)
   eassert (! p->is_server);
   p->port = port;
   p->socktype = socktype;
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
   eassert (! p->dns_request);
 #endif
 #ifdef HAVE_GNUTLS
@@ -4303,10 +4596,10 @@ usage: (make-network-process &rest ARGS)  */)
     p->is_non_blocking_client = true;
 
   bool postpone_connection = false;
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
   /* With async address resolution, the list of addresses is empty, so
      postpone connecting to the server. */
-  if (!p->is_server && NILP (addrinfos))
+  if (!p->is_server && NILP (addrinfos) && dns_request)
     {
       p->dns_request = dns_request;
       p->status = list1 (Qconnect);
@@ -5183,7 +5476,7 @@ server_accept_connection (Lisp_Object server, int channel)
   exec_sentinel (proc, concat3 (open_from, host_string, nl));
 }
 
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
 static Lisp_Object
 check_for_dns (Lisp_Object proc)
 {
@@ -5194,6 +5487,7 @@ check_for_dns (Lisp_Object proc)
   if (! p->dns_request)
     return Qnil;
 
+#ifdef HAVE_GETADDRINFO_A
   int ret = gai_error (p->dns_request);
   if (ret == EAI_INPROGRESS)
     return Qt;
@@ -5218,6 +5512,31 @@ check_for_dns (Lisp_Object proc)
 				 build_string (p->dns_request->ar_name),
 				 build_string (" failed")))));
     }
+#else /* HAVE_NS */
+  if (__atomic_load_n (&p->dns_request->state, __ATOMIC_ACQUIRE) == DNS_RUNNING)
+    return Qt;
+
+  /* We got a response. */
+  if (p->dns_request->gai_error == 0)
+    {
+      struct addrinfo *res;
+
+      for (res = p->dns_request->ar_result; res; res = res->ai_next)
+	addrinfos = Fcons (conv_addrinfo_to_lisp (res), addrinfos);
+
+      addrinfos = Fnreverse (addrinfos);
+    }
+  /* The DNS lookup failed. */
+  else if (connecting_status (p->status))
+    {
+      deactivate_process (proc);
+      pset_status (p, (list2
+		       (Qfailed,
+			concat3 (build_string ("Name lookup of "),
+				 build_string (p->dns_request->hostname),
+				 build_string (" failed")))));
+    }
+#endif
 
   free_dns_request (proc);
 
@@ -5228,7 +5547,7 @@ check_for_dns (Lisp_Object proc)
   return addrinfos;
 }
 
-#endif /* HAVE_GETADDRINFO_A */
+#endif /* HAVE_GETADDRINFO_A || HAVE_NS */
 
 static void
 wait_for_socket_fds (Lisp_Object process, char const *name)
@@ -5355,7 +5674,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
   enum { MINIMUM = -1, TIMEOUT, FOREVER } wait;
   int got_some_output = -1;
   uintmax_t prev_wait_proc_nbytes_read = wait_proc ? wait_proc->nbytes_read : 0;
-#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
+#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS || defined HAVE_NS
   bool retry_for_async;
 #endif
   specpdl_ref count = SPECPDL_INDEX ();
@@ -5410,7 +5729,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 
       eassert (max_desc < FD_SETSIZE);
 
-#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
+#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS || defined HAVE_NS
       {
 	Lisp_Object process_list_head, aproc;
 	struct Lisp_Process *p;
@@ -5422,7 +5741,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 
 	    if (! wait_proc || p == wait_proc)
 	      {
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
 		/* Check for pending DNS requests. */
 		if (p->dns_request)
 		  {
@@ -5734,7 +6053,7 @@ wait_reading_process_output (intmax_t time_limit, int nsecs, int read_kbd,
 	  else
 	    got_output_end_time = invalid_timespec ();
 
-#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS
+#if defined HAVE_GETADDRINFO_A || defined HAVE_GNUTLS || defined HAVE_NS
 	  if (retry_for_async
 	      && (timeout.tv_sec > 0 || timeout.tv_nsec > ASYNC_RETRY_NSEC))
 	    {

@@ -1028,6 +1028,17 @@ ns_constrain_all_frames (void)
 }
 
 
+/* Cache for ns_update_auto_hide_menu_bar: avoids block_input /
+   Objective-C messaging on every redisplay cycle when the setting
+   has not changed.  Qunbound forces reapplication.  */
+static Lisp_Object last_ns_auto_hide_menu_bar;
+
+static void
+ns_reset_menu_bar_cache (void)
+{
+  last_ns_auto_hide_menu_bar = Qunbound;
+}
+
 static void
 ns_update_auto_hide_menu_bar (void)
 /* --------------------------------------------------------------------------
@@ -1036,6 +1047,13 @@ ns_update_auto_hide_menu_bar (void)
 {
 #ifdef NS_IMPL_COCOA
   NSTRACE ("ns_update_auto_hide_menu_bar");
+
+  /* Quick check: skip if the setting hasn't changed since last
+     time.  The cache is reset on app activation to ensure
+     presentation options are reapplied.  */
+  if (EQ (ns_auto_hide_menu_bar, last_ns_auto_hide_menu_bar))
+    return;
+  last_ns_auto_hide_menu_bar = ns_auto_hide_menu_bar;
 
   block_input ();
 
@@ -5620,10 +5638,19 @@ ns_update_window_end (struct window *w, bool cursor_on_p,
 static void
 ns_flush_display (struct frame *f)
 {
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+  /* On macOS 10.14+, drawing uses CALayer-backed IOSurfaces.
+     unlockFocus already marks the view as needing display via
+     setNeedsDisplay:YES, and the display method on EmacsLayer handles
+     the actual VRAM transfer.  Running the event loop here is
+     unnecessary overhead.  */
+  return;
+#else
   struct input_event ie;
 
   EVENT_INIT (ie);
   ns_read_socket_1 (FRAME_TERMINAL (f), &ie, YES);
+#endif
 }
 
 /* This and next define (many of the) public functions in this
@@ -6579,6 +6606,7 @@ not_in_argv (NSString *arg)
 #endif
   // ns_app_active=YES;
 
+  ns_reset_menu_bar_cache ();
   ns_update_auto_hide_menu_bar ();
   // No constraining takes place when the application is not active.
   ns_constrain_all_frames ();
@@ -8871,6 +8899,8 @@ ns_in_echo_area (void)
         {
 #ifdef NS_IMPL_COCOA
           [NSApp setPresentationOptions: NSApplicationPresentationDefault];
+          ns_menu_bar_is_hidden = NO;
+          ns_reset_menu_bar_cache ();
 #else
           [NSMenu setMenuBarVisible:YES];
 #endif
@@ -10961,6 +10991,8 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
      be used next time we create a new context.  */
   if (cs)
     colorSpace = cs;
+  else if (ns_use_srgb_colorspace)
+    colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   else
     colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceGenericRGB);
 }
@@ -11036,14 +11068,31 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       int width = NSWidth ([self bounds]) * scale;
       int height = NSHeight ([self bounds]) * scale;
 
+      /* Prefer reusing the currently displayed surface when it is no
+         longer in use by the GPU.  This avoids the full-frame memcpy
+         in copyContentsTo: since source == destination short-circuits.
+         Only fall back to a different surface if the displayed one is
+         still being transferred to VRAM.  */
+      IOSurfaceRef displayed = (IOSurfaceRef)[self contents];
+      IOSurfaceRef fallback = NULL;
       for (id object in cache)
         {
           if (!IOSurfaceIsInUse ((IOSurfaceRef)object))
             {
-              surface = (IOSurfaceRef)object;
-              [cache removeObject:object];
-              break;
+              if ((IOSurfaceRef)object == displayed)
+                {
+                  surface = displayed;
+                  [cache removeObject:object];
+                  break;
+                }
+              if (!fallback)
+                fallback = (IOSurfaceRef)object;
             }
+        }
+      if (!surface && fallback)
+        {
+          surface = fallback;
+          [cache removeObject:(id)fallback];
         }
 
       if (!surface && [cache count] >= (doubleBuffered ? 2 : 1))

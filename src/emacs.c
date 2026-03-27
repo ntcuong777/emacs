@@ -2065,10 +2065,6 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 #endif
 
 #ifdef HAVE_NS
-  /* For early calls to ns_lisp_to_color or Fns_list_colors.  */
-  if (!dump_mode)
-    ns_init_colors ();
-
   if (!noninteractive)
     {
 #ifdef NS_IMPL_COCOA
@@ -2180,6 +2176,10 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
   globals_of_kqueue ();
 #endif
 
+#ifdef HAVE_FSEVENTS
+  globals_of_fsevents ();
+#endif
+
 #ifdef HAVE_GFILENOTIFY
   globals_of_gfilenotify ();
 #endif
@@ -2237,6 +2237,13 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
   init_callproc ();	/* Must follow init_cmdargs but not init_sys_modes.  */
   init_fileio ();
   init_lread ();
+
+#ifdef HAVE_NS
+  /* init_lread finalizes data-directory, which ns_init_colors needs
+     even in batch mode for color lookups such as ns-list-colors.  */
+  if (!dump_mode)
+    ns_init_colors ();
+#endif
 
   /* If "-version" was specified, produce version information and
      exit.  We do it here because the code below needs to call Lisp
@@ -2481,6 +2488,10 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 #ifdef HAVE_KQUEUE
       syms_of_kqueue ();
 #endif /* HAVE_KQUEUE */
+
+#ifdef HAVE_FSEVENTS
+      syms_of_fsevents ();
+#endif /* HAVE_FSEVENTS */
 
 #ifdef HAVE_GFILENOTIFY
       syms_of_gfilenotify ();

@@ -625,17 +625,18 @@ AC_ARG_WITH([shared-user-id],
     [use the given shared user ID in Android builds])])
 
 AC_ARG_WITH([file-notification],[AS_HELP_STRING([--with-file-notification=LIB],
- [use a file notification library (LIB one of: yes, inotify, kqueue, gfile, w32, no)])],
+ [use a file notification library (LIB one of: yes, inotify, kqueue, fsevents, gfile, w32, no)])],
  [ case "${withval}" in
     y | ye | yes )	val=yes ;;
     n | no )		val=no  ;;
     i | in | ino | inot | inoti | inotif | inotify )	val=inotify ;;
     k | kq | kqu | kque | kqueu | kqueue )	val=kqueue ;;
+    f | fs | fse | fsev | fseve | fseven | fsevent | fsevents )	val=fsevents ;;
     g | gf | gfi | gfil | gfile )	val=gfile ;;
     w | w3 | w32 )	val=w32 ;;
     * ) AC_MSG_ERROR(['--with-file-notification=$withval' is invalid;
-this option's value should be 'yes', 'no', 'inotify', 'kqueue', 'gfile' or 'w32'.
-'yes' is a synonym for 'w32' on MS-Windows, for 'no' on Nextstep,
+this option's value should be 'yes', 'no', 'inotify', 'kqueue', 'fsevents', 'gfile' or 'w32'.
+'yes' is a synonym for 'w32' on MS-Windows, for 'fsevents' on macOS,
 otherwise for the first of 'inotify', 'kqueue' or 'gfile' that is usable.])
     ;;
    esac
@@ -2427,6 +2428,22 @@ AC_DEFINE_UNQUOTED([SYSTEM_TYPE], ["$SYSTEM_TYPE"],
   [The type of system you are compiling for; sets 'system-type'.])
 AC_SUBST([SYSTEM_TYPE])
 
+OPTION_DEFAULT_OFF([poll],
+  [(experimental) use 'poll' instead of 'select' for checking file
+  descriptor status.])
+if test "$with_poll" = yes; then
+  AC_CHECK_HEADERS([poll.h])
+  if test "x$ac_cv_header_poll_h" = xyes; then
+    AC_DEFINE([USE_POLL], 1, [Define to 1 if you use poll.])
+    USE_POLL=yes
+    dnl Check for ppoll, which allows atomic signal masking during poll.
+    dnl Available on Linux, macOS 10.15+, FreeBSD 11+, OpenBSD 5.2+.
+    AC_CHECK_FUNCS([ppoll])
+  else
+    USE_POLL=no
+  fi
+fi
+
 pre_PKG_CONFIG_CFLAGS=$CFLAGS
 pre_PKG_CONFIG_LIBS=$LIBS
 
@@ -4126,6 +4143,7 @@ AC_SUBST(TREE_SITTER_LIBS)
 AC_SUBST(TREE_SITTER_CFLAGS)
 
 NOTIFY_OBJ=
+NOTIFY_OBJC_OBJ=
 NOTIFY_SUMMARY=no
 
 dnl MS Windows native file monitor is available for mingw32 only.
@@ -4141,6 +4159,23 @@ case $with_file_notification,$opsys in
        AC_DEFINE([HAVE_W32NOTIFY], [1], [Define to 1 to use w32notify.])
        NOTIFY_OBJ=w32notify.o
        NOTIFY_SUMMARY="yes (w32)"
+    fi ;;
+esac
+
+dnl FSEvents is available on macOS (Darwin) via CoreServices framework.
+dnl Uses a dedicated CFRunLoop thread, so it works in all Emacs
+dnl configurations (GUI, daemon, terminal) -- no NS port required.
+case $with_file_notification,$NOTIFY_OBJ in
+  fsevents,* | yes,)
+    if test "$opsys" = "darwin"; then
+      AC_CHECK_HEADER([CoreServices/CoreServices.h])
+      if test "$ac_cv_header_CoreServices_CoreServices_h" = yes; then
+        AC_DEFINE([HAVE_FSEVENTS], [1], [Define to 1 to use FSEvents.])
+        NOTIFY_OBJ=fsevents.o
+        NOTIFY_OBJC_OBJ=fsevents.o
+        NOTIFY_LIBS="$NOTIFY_LIBS -framework CoreServices"
+        NOTIFY_SUMMARY="yes (fsevents)"
+      fi
     fi ;;
 esac
 
@@ -4162,21 +4197,31 @@ AS_IF([test "$opsys" != "haiku"], [
  dnl kqueue is available on BSD-like systems and Haiku, but Haiku's
  dnl implementation cannot monitor filesystem activity.
  case $with_file_notification,$NOTIFY_OBJ in
-   kqueue,* | yes,)
+   kqueue,* | yes, | yes,fsevents.o | fsevents,fsevents.o)
      EMACS_CHECK_MODULES([KQUEUE], [libkqueue])
      if test "$HAVE_KQUEUE" = "yes"; then
 	AC_DEFINE([HAVE_KQUEUE], [1], [Define to 1 to use kqueue.])
 	CPPFLAGS="$CPPFLAGS -I/usr/include/kqueue"
-	NOTIFY_CFLAGS=$KQUEUE_CFLAGS
-	NOTIFY_LIBS=$KQUEUE_LIBS
-	NOTIFY_OBJ=kqueue.o
-	NOTIFY_SUMMARY="yes -lkqueue"
+	NOTIFY_CFLAGS="$NOTIFY_CFLAGS $KQUEUE_CFLAGS"
+	NOTIFY_LIBS="$NOTIFY_LIBS $KQUEUE_LIBS"
+	if test -n "$NOTIFY_OBJ"; then
+	  NOTIFY_OBJ="$NOTIFY_OBJ kqueue.o"
+	  NOTIFY_SUMMARY="yes (fsevents, kqueue)"
+	else
+	  NOTIFY_OBJ=kqueue.o
+	  NOTIFY_SUMMARY="yes -lkqueue"
+	fi
      else
 	AC_SEARCH_LIBS([kqueue], [])
 	if test "$ac_cv_search_kqueue" != no; then
 	  AC_DEFINE([HAVE_KQUEUE], [1], [Define to 1 to use kqueue.])
-	  NOTIFY_OBJ=kqueue.o
-	  NOTIFY_SUMMARY="yes (kqueue)"
+	  if test -n "$NOTIFY_OBJ"; then
+	    NOTIFY_OBJ="$NOTIFY_OBJ kqueue.o"
+	    NOTIFY_SUMMARY="yes (fsevents, kqueue)"
+	  else
+	    NOTIFY_OBJ=kqueue.o
+	    NOTIFY_SUMMARY="yes (kqueue)"
+	  fi
 	fi
      fi ;;
  esac])
@@ -4213,6 +4258,7 @@ fi
 AC_SUBST([NOTIFY_CFLAGS])
 AC_SUBST([NOTIFY_LIBS])
 AC_SUBST([NOTIFY_OBJ])
+AC_SUBST([NOTIFY_OBJC_OBJ])
 
 dnl Do not put whitespace before the #include statements below.
 dnl Older compilers (eg sunos4 cc) choke on it.
@@ -7681,14 +7727,14 @@ for opt in ACL BE_APP CAIRO DBUS FREETYPE GCONF GIF GLIB GMP GNUTLS GPM GSETTING
  M17N_FLT MODULES MPS NATIVE_COMP NOTIFY NS OLDXMENU PDUMPER PGTK PNG RSVG SECCOMP \
  SOUND SQLITE3 THREADS TIFF TOOLKIT_SCROLL_BARS TREE_SITTER \
  UNEXEC WEBP X11 XAW3D XDBE XFT XIM XINERAMA XINPUT2 XPM XRANDR XWIDGETS \
- X_TOOLKIT ZLIB; do
+ X_TOOLKIT ZLIB POLL; do
 
     case $opt in
       PDUMPER) val=${with_pdumper} ;;
       UNEXEC) val=no ;;
       GLIB) val=${emacs_cv_links_glib} ;;
       NOTIFY|ACL) eval val=\${${opt}_SUMMARY} ;;
-      TOOLKIT_SCROLL_BARS|X_TOOLKIT) eval val=\${USE_$opt} ;;
+      TOOLKIT_SCROLL_BARS|X_TOOLKIT|POLL) eval val=\${USE_$opt} ;;
       THREADS) val=${threads_enabled} ;;
       *) eval val=\${HAVE_$opt} ;;
     esac
@@ -7766,6 +7812,7 @@ AS_ECHO(["  Does Emacs use -lXaw3d?                                 ${HAVE_XAW3D
   Does Emacs have native lisp compiler?                   ${HAVE_NATIVE_COMP}
   Does Emacs use version 2 of the X Input Extension?      ${HAVE_XINPUT2}
   Does Emacs generate a smaller-size Japanese dictionary? ${with_small_ja_dic}
+  Does Emacs use 'poll'?                                  ${USE_POLL}
 "])
 
 if test -n "${EMACSDATA}"; then

@@ -56,6 +56,8 @@
 (require 'ert-x)
 (require 'filenotify)
 
+(declare-function fsevents--debug-stream-count "fsevents.m" ())
+
 (defvar auto-revert-buffer-list)
 
 ;; Filter suppressed remote file-notify libraries.
@@ -281,6 +283,76 @@ must be a valid watch descriptor."
               (ert-skip "Cannot determine test monitor")))
 	  (alist-get file-notify--test-desc file-notify--test-monitors))
     (ert-skip "`file-notify--test-desc' is nil when checking for test monitor")))
+
+(ert-deftest file-notify-test-select-backend-fsevents-preferred ()
+  "FSEvents is preferred when available, falls back to kqueue otherwise."
+  (let ((orig-featurep (symbol-function 'featurep)))
+    ;; When fsevents is available, it is always selected.
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (pcase feature
+                   ('fsevents t)
+                   ('inotify nil)
+                   ('kqueue t)
+                   ('gfilenotify nil)
+                   ('w32notify nil)
+                   (_ (funcall orig-featurep feature))))))
+      (should (eq (file-notify--select-backend) 'fsevents)))
+    ;; When fsevents is not available, fall back to kqueue.
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (pcase feature
+                   ('fsevents nil)
+                   ('inotify nil)
+                   ('kqueue t)
+                   ('gfilenotify nil)
+                   ('w32notify nil)
+                   (_ (funcall orig-featurep feature))))))
+      (should (eq (file-notify--select-backend) 'kqueue)))))
+
+(ert-deftest file-notify-test-add-watch-fsevents-preserves-file-target ()
+  "Pass the original file target to the FSEvents backend."
+  (let (captured)
+    (cl-letf (((symbol-function 'fsevents-add-watch)
+               (lambda (file flags callback)
+                 (setq captured (list file flags callback))
+                 1)))
+      (should (= (file-notify--add-watch-fsevents
+                  "/tmp/watch-me"
+                  "/tmp"
+                  '(change attribute-change))
+                 1))
+      (should (equal (car captured) "/tmp/watch-me"))
+      (should (equal (nth 1 captured)
+                     '(create delete write rename attrib)))
+      (should (eq (nth 2 captured) #'file-notify--callback-fsevents)))))
+
+(ert-deftest file-notify-test-callback-fsevents-swallows-only-terminal-symlink-delete ()
+  "Only terminal delete/rename of a watched symlink leaf is hidden."
+  (let ((desc 17)
+        (calls nil))
+    (unwind-protect
+        (progn
+          (puthash desc
+                   (file-notify--watch-make "/tmp" "link" #'ignore)
+                   file-notify-descriptors)
+          (puthash desc t file-notify--fsevents-symlink-descriptors)
+          (cl-letf (((symbol-function 'file-notify--handle-event)
+                     (lambda (&rest args)
+                       (push args calls))))
+            (file-notify--callback-fsevents
+             (list desc '(stopped) "/tmp/link"))
+            (should (equal 1 (length calls)))
+            (should (equal (list desc '(stopped) "/tmp/link" nil)
+                           (car calls)))
+            (setq calls nil)
+            (file-notify--callback-fsevents
+             (list desc '(delete stopped) "/tmp/link"))
+            (should-not calls)
+            (should-not (gethash desc file-notify-descriptors))
+            (should-not (gethash desc file-notify--fsevents-symlink-descriptors))))
+      (remhash desc file-notify--fsevents-symlink-descriptors)
+      (remhash desc file-notify-descriptors))))
 
 (defmacro file-notify--deftest-remote (test docstring &optional unstable)
   "Define ert `TEST-remote' for remote files.
@@ -1495,6 +1567,57 @@ the file watch."
 (file-notify--deftest-remote file-notify-test09-watched-file-in-watched-dir
   "Check `file-notify-test09-watched-file-in-watched-dir' for remote files.")
 
+(ert-deftest file-notify-test09a-fsevents-shares-native-streams ()
+  "Check that nested FSEvents watches share one native stream."
+  :tags '(:expensive-test)
+  (skip-unless (file-notify--test-local-enabled))
+  (skip-unless (string-equal (file-notify--test-library) "fsevents"))
+
+  (with-file-notify-test
+   (let* ((subdir (expand-file-name "sub" file-notify--test-tmpdir)))
+     (make-directory subdir)
+     (should (= 0 (fsevents--debug-stream-count)))
+     (setq file-notify--test-desc1
+           (file-notify-add-watch file-notify--test-tmpdir '(change) #'ignore))
+     (should (= 1 (fsevents--debug-stream-count)))
+     (setq file-notify--test-desc2
+           (file-notify-add-watch subdir '(change) #'ignore))
+     (should (= 1 (fsevents--debug-stream-count)))
+     (file-notify-rm-watch file-notify--test-desc1)
+     (setq file-notify--test-desc1 nil)
+     (should (= 1 (fsevents--debug-stream-count)))
+     (file-notify-rm-watch file-notify--test-desc2)
+     (setq file-notify--test-desc2 nil)
+     (should (= 0 (fsevents--debug-stream-count)))
+     (file-notify--test-cleanup-p))))
+
+(ert-deftest file-notify-test09b-fsevents-promotes-sibling-streams ()
+  "Check that many sibling FSEvents watches share one parent stream."
+  :tags '(:expensive-test)
+  (skip-unless (file-notify--test-local-enabled))
+  (skip-unless (string-equal (file-notify--test-library) "fsevents"))
+
+  (with-file-notify-test
+   (let ((subdirs (mapcar (lambda (n)
+                            (expand-file-name
+                             (format "d%d" n) file-notify--test-tmpdir))
+                          (number-sequence 1 8)))
+         (descs nil))
+     (dolist (dir subdirs)
+       (make-directory dir))
+     (should (= 0 (fsevents--debug-stream-count)))
+     (dolist (dir subdirs)
+       (push (file-notify-add-watch dir '(change) #'ignore) descs))
+     (setq file-notify--test-desc1 (car descs)
+           file-notify--test-desc2 (cadr descs))
+     (should (= 1 (fsevents--debug-stream-count)))
+     (dolist (desc descs)
+       (file-notify-rm-watch desc))
+     (setq file-notify--test-desc1 nil
+           file-notify--test-desc2 nil)
+     (should (= 0 (fsevents--debug-stream-count)))
+     (file-notify--test-cleanup-p))))
+
 (ert-deftest file-notify-test10-sufficient-resources ()
   "Check that file notification does not use too many resources."
   :tags '(:expensive-test)
@@ -1651,6 +1774,44 @@ the file watch."
        (file-notify-rm-watch file-notify--test-desc)
        (file-notify--test-cleanup-p)))))
 
+  (with-file-notify-test
+   (ert-with-temp-directory file-notify--test-tmpfile1
+     :prefix (concat ert-temp-file-prefix "-slash-parent")
+     (delete-file file-notify--test-tmpfile)
+     ;; Symlink a directory, but watch it with a trailing slash.
+     (let ((tmpfile (expand-file-name "foo" file-notify--test-tmpfile))
+           (tmpfile1 (expand-file-name "foo" file-notify--test-tmpfile1)))
+       (make-symbolic-link file-notify--test-tmpfile1 file-notify--test-tmpfile)
+       (write-region "any text" nil tmpfile1 nil 'no-message)
+       (should
+	(setq file-notify--test-desc
+	      (file-notify--test-add-watch
+               (file-name-as-directory file-notify--test-tmpfile)
+               '(attribute-change change) #'file-notify--test-event-handler)))
+       (should (file-notify-valid-p file-notify--test-desc))
+
+       ;; None of the actions on a file in the symlinked directory
+       ;; will be reported, even with the slash-suffixed watch path.
+       (file-notify--test-with-actions nil
+         (write-region "another text" nil tmpfile nil 'no-message)
+         (write-region "another text" nil tmpfile1 nil 'no-message)
+         (set-file-times tmpfile '(0 0))
+         (set-file-times tmpfile '(0 0) 'nofollow)
+         (set-file-times tmpfile1 '(0 0))
+         (set-file-times tmpfile1 '(0 0) 'nofollow)
+         (delete-file tmpfile)
+         (delete-file tmpfile1))
+       ;; Sanity check.
+       (file-notify--test-wait-for-events
+        (file-notify--test-timeout)
+        (not (input-pending-p)))
+       (should-not file-notify--test-events)
+
+       ;; The environment shall be cleaned up.
+       (delete-directory file-notify--test-tmpdir 'recursive)
+       (file-notify-rm-watch file-notify--test-desc)
+       (file-notify--test-cleanup-p)))))
+
 (file-notify--deftest-remote file-notify-test11-symlinks
   "Check `file-notify-test11-symlinks' for remote files.")
 
@@ -1679,6 +1840,7 @@ the file watch."
              (pcase (file-notify--test-library)
                ((or "inotify" "inotifywait") '(unmount isdir))
                ((or "gfilenotify" "gio") '(unmounted))
+               ("fsevents" '(stopped))
                ("kqueue" '(revoke))
                (err (ert-fail (format "Library %s not supported" err))))
              (pcase (file-notify--test-library)
@@ -1689,6 +1851,7 @@ the file watch."
              )
        :-callback
        (pcase (file-notify--test-library)
+         ("fsevents" #'file-notify--callback-fsevents)
          ("inotify" #'file-notify--callback-inotify)
          ("gfilenotify" #'file-notify--callback-gfilenotify)
          ("kqueue" #'file-notify--callback-kqueue)
