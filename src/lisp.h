@@ -5394,6 +5394,12 @@ extern void globals_of_kqueue (void);
 extern void syms_of_kqueue (void);
 #endif
 
+/* Defined in fsevents.m */
+#ifdef HAVE_FSEVENTS
+extern void globals_of_fsevents (void);
+extern void syms_of_fsevents (void);
+#endif
+
 /* Defined in gfilenotify.c */
 #ifdef HAVE_GFILENOTIFY
 extern void globals_of_gfilenotify (void);

@@ -33,12 +33,20 @@
 (defvar file-notify-debug nil
   "Use for debug messages.")
 
-(defconst file-notify--library
+(defun file-notify--select-backend ()
+  "Return the local file notification backend for this session."
   (cond
+   ;; FSEvents uses a serial GCD dispatch queue, so it works in all
+   ;; Emacs configurations: GUI, daemon, and terminal.  Prefer it on
+   ;; macOS over kqueue (which requires one FD per watched file).
+   ((featurep 'fsevents) 'fsevents)
    ((featurep 'inotify) 'inotify)
    ((featurep 'kqueue) 'kqueue)
    ((featurep 'gfilenotify) 'gfilenotify)
-   ((featurep 'w32notify) 'w32notify))
+   ((featurep 'w32notify) 'w32notify)))
+
+(defconst file-notify--library
+  (file-notify--select-backend)
   "Non-nil when Emacs has been compiled with file notification support.
 The value is the name of the low-level file notification package
 to be used for local file systems.  Remote file notifications
@@ -71,6 +79,29 @@ A key in this hash table is the descriptor as returned from
 `inotify', `kqueue', `gfilenotify', `w32notify' or a file name
 handler.  The value in the hash table is a `file-notify--watch'
 struct.")
+
+(defvar file-notify--fsevents-symlink-descriptors (make-hash-table :test 'equal)
+  "Descriptors of FSEvents watches whose leaf was a symlink.
+This is FSEvents-specific state used only to silence terminal
+delete/rename of a watched symlink leaf while still forwarding
+broader `stopped' conditions.")
+
+(defun file-notify--rm-descriptor (descriptor)
+  "Remove DESCRIPTOR from `file-notify-descriptors'.
+DESCRIPTOR should be an object returned by `file-notify-add-watch'.
+If it is registered in `file-notify-descriptors', a `stopped' event is sent."
+  (when-let* ((watch (gethash descriptor file-notify-descriptors)))
+    (unwind-protect
+        ;; Insert `stopped' event.
+        (insert-special-event
+         (make-file-notify
+          :-event `(,descriptor stopped
+                    ,(file-notify--watch-absolute-filename watch))
+          :-callback (file-notify--watch-callback watch)))
+      ;; Make sure this is the last time the callback was invoked.
+      (setf (file-notify--watch-callback watch) nil)
+      (remhash descriptor file-notify--fsevents-symlink-descriptors)
+      (remhash descriptor file-notify-descriptors))))
 
 (cl-defstruct (file-notify (:type list) :named)
   "A file system monitoring event, coming from the backends."
@@ -128,6 +159,31 @@ It is nil or a `file-notify--rename' defstruct where the cookie can be nil.")
                         ((memq action '(stopped ignored unmount)) 'stopped)))
                      actions))
    file file1-or-cookie))
+
+(cl-defun file-notify--callback-fsevents ((desc actions file
+                                           &optional file1-or-cookie))
+  "Notification callback for fsevents."
+  (if (and (gethash desc file-notify--fsevents-symlink-descriptors)
+	   (memq 'stopped actions)
+	   (or (memq 'delete actions)
+	       (memq 'rename actions)))
+      ;; Watched symlink leaf was deleted/renamed: silently drop the
+      ;; descriptor, but keep broader plain `stopped' visible.
+      (progn
+	(remhash desc file-notify--fsevents-symlink-descriptors)
+	(remhash desc file-notify-descriptors))
+    (file-notify--handle-event
+     desc
+     (delq nil (mapcar (lambda (action)
+			 (cond
+			  ((eq action 'create) 'created)
+			  ((eq action 'write) 'changed)
+			  ((eq action 'attrib) 'attribute-changed)
+			  ((eq action 'delete) 'deleted)
+			  ((eq action 'rename) 'renamed)
+			  ((eq action 'stopped) 'stopped)))
+		       actions))
+     file file1-or-cookie)))
 
 (cl-defun file-notify--callback-kqueue ((desc actions file
                                          &optional file1-or-cookie))
@@ -337,10 +393,27 @@ DESC is the back-end descriptor.  ACTIONS is a list of:
             (setf (file-notify--watch-callback watch) nil))
           (file-notify-rm-watch desc))))))
 
+(declare-function fsevents-add-watch "fsevents.m" (file flags callback))
 (declare-function inotify-add-watch "inotify.c" (file flags callback))
 (declare-function kqueue-add-watch "kqueue.c" (file flags callback))
 (declare-function w32notify-add-watch "w32notify.c" (file flags callback))
 (declare-function gfile-add-watch "gfilenotify.c" (file flags callback))
+
+(defun file-notify--add-watch-fsevents (file _dir flags)
+  "Add a watch for FILE in DIR with FLAGS, using fsevents."
+  (let* ((backend-file (directory-file-name file))
+	 (desc (fsevents-add-watch
+		backend-file
+		(append
+		 (and (memq 'change flags)
+		      '(create delete write rename))
+		 (and (memq 'attribute-change flags)
+		      '(attrib)))
+		#'file-notify--callback-fsevents)))
+    (if (file-symlink-p backend-file)
+	(puthash desc t file-notify--fsevents-symlink-descriptors)
+      (remhash desc file-notify--fsevents-symlink-descriptors))
+    desc))
 
 (defun file-notify--add-watch-inotify (_file dir flags)
   "Add a watch for FILE in DIR with FLAGS, using inotify."
@@ -444,6 +517,7 @@ FILE is the name of the file whose event is being reported."
                (funcall handler 'file-notify-add-watch dir flags callback)
              (funcall
               (pcase file-notify--library
+                ('fsevents    #'file-notify--add-watch-fsevents)
                 ('inotify     #'file-notify--add-watch-inotify)
                 ('kqueue      #'file-notify--add-watch-kqueue)
                 ('w32notify   #'file-notify--add-watch-w32notify)
@@ -480,6 +554,7 @@ DESCRIPTOR should be an object returned by `file-notify-add-watch'."
 
               (funcall
                (cond
+                ((eq file-notify--library 'fsevents) 'fsevents-rm-watch)
                 ((eq file-notify--library 'inotify) 'inotify-rm-watch)
                 ((eq file-notify--library 'kqueue) 'kqueue-rm-watch)
                 ((eq file-notify--library 'gfilenotify) 'gfile-rm-watch)
@@ -509,6 +584,8 @@ DESCRIPTOR should be an object returned by `file-notify-add-watch'."
    (lambda (key _value)
      (file-notify-rm-watch key))
    file-notify-descriptors)
+  (setq file-notify--fsevents-symlink-descriptors
+	(clrhash file-notify--fsevents-symlink-descriptors))
   (setq file-notify-descriptors (clrhash file-notify-descriptors)))
 
 (defun file-notify-valid-p (descriptor)
@@ -524,6 +601,7 @@ DESCRIPTOR should be an object returned by `file-notify-add-watch'."
                (funcall handler 'file-notify-valid-p descriptor)
              (funcall
               (cond
+               ((eq file-notify--library 'fsevents) 'fsevents-valid-p)
                ((eq file-notify--library 'inotify) 'inotify-valid-p)
                ((eq file-notify--library 'kqueue) 'kqueue-valid-p)
                ((eq file-notify--library 'gfilenotify) 'gfile-valid-p)
