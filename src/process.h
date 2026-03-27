@@ -191,10 +191,14 @@ struct Lisp_Process
     /* The socket type. */
     int socktype;
 
-#ifdef HAVE_GETADDRINFO_A
+#if defined HAVE_GETADDRINFO_A || defined HAVE_NS
     /* Whether the socket is waiting for response from an asynchronous
        DNS call. */
+#ifdef HAVE_GETADDRINFO_A
     struct gaicb *dns_request;
+#else
+    struct ns_dns_request *dns_request;
+#endif
 #endif
 
 #ifdef HAVE_GNUTLS

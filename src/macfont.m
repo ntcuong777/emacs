@@ -602,17 +602,27 @@ mac_screen_font_shape (ScreenFontRef font, CFStringRef string,
 static CGColorRef
 get_cgcolor(unsigned long color)
 {
-  NSColor *nsColor = [NSColor colorWithUnsignedLong:color];
-  [nsColor set];
-  CGColorSpaceRef colorSpace = [[nsColor colorSpace] CGColorSpace];
-  NSInteger noc = [nsColor numberOfComponents];
-  CGFloat *components = xmalloc (sizeof(CGFloat)*(1+noc));
-  CGColorRef cgColor;
+  /* Decompose the packed ARGB color directly into CGFloat components,
+     avoiding NSColor allocation and xmalloc overhead.  This function
+     is called from drawing macros on every glyph string render.  */
+  CGFloat a = (CGFloat)((color >> 24) & 0xff) / 255.0;
+  CGFloat r = (CGFloat)((color >> 16) & 0xff) / 255.0;
+  CGFloat g = (CGFloat)((color >> 8) & 0xff) / 255.0;
+  CGFloat b = (CGFloat)(color & 0xff) / 255.0;
 
-  [nsColor getComponents: components];
-  cgColor = CGColorCreate (colorSpace, components);
-  xfree (components);
-  return cgColor;
+  /* Cache both colorspaces.  ns_use_srgb_colorspace (a Lisp variable
+     exposed via globals.h) controls which one matches the EmacsLayer
+     and NSColor pipeline.  */
+  static CGColorSpaceRef srgb, generic_rgb;
+  if (!srgb)
+    {
+      srgb = CGColorSpaceCreateWithName (kCGColorSpaceSRGB);
+      generic_rgb = CGColorSpaceCreateWithName (kCGColorSpaceGenericRGB);
+    }
+
+  CGFloat components[] = { r, g, b, a };
+  return CGColorCreate (ns_use_srgb_colorspace ? srgb : generic_rgb,
+                        components);
 }
 
 static CGColorRef

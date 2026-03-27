@@ -871,6 +871,11 @@ See the documentation of `create-fontset-from-fontset-spec' for the format.")
 
   (x-apply-session-resources)
 
+  ;; Refresh x-colors now that the display is available.  The value
+  ;; from the dump may have been captured in a headless environment
+  ;; where ns-list-colors returns a limited set.
+  (setq x-colors (ns-list-colors))
+
   ;; Don't let Emacs suspend under NS.
   (add-hook 'suspend-hook 'ns-suspend-error)
 
