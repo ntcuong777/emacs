@@ -2065,10 +2065,12 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
 #endif
 
 #ifdef HAVE_NS
+#ifndef NTCUONG_NS_BATCH_COLOR_INIT
   /* For early calls to ns_lisp_to_color or Fns_list_colors.  */
   if (!dump_mode)
     ns_init_colors ();
 
+#endif /* ! NTCUONG_NS_BATCH_COLOR_INIT */
   if (!noninteractive)
     {
 #ifdef NS_IMPL_COCOA
@@ -2237,6 +2239,15 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
   init_callproc ();	/* Must follow init_cmdargs but not init_sys_modes.  */
   init_fileio ();
   init_lread ();
+
+#ifdef HAVE_NS
+#ifdef NTCUONG_NS_BATCH_COLOR_INIT
+  /* init_lread finalizes data-directory, which ns_init_colors needs
+     even in batch mode for color lookups such as ns-list-colors.  */
+  if (!dump_mode)
+    ns_init_colors ();
+#endif /* NTCUONG_NS_BATCH_COLOR_INIT */
+#endif
 
   /* If "-version" was specified, produce version information and
      exit.  We do it here because the code below needs to call Lisp
