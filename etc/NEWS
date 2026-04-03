@@ -2540,6 +2540,12 @@ of a literal newline.  This prevents executing many Dired operations on
 such a file from failing and signaling an error.  The default value of
 this user option is nil.
 
+---
+*** New Dired handling of errors from 'ls'.
+When invoking a Dired command causes 'ls' to emit an error message,
+Emacs now displays the message in a popped up buffer instead of
+outputting it in the Dired buffer and signaling an error.
+
 ** Grep
 
 +++
@@ -3195,6 +3201,11 @@ This minor mode binds 'xref-find-definitions-at-mouse' to
 'C-<down-mouse-1>', allowing you to "control click" to jump to a
 definition, following the convention from other editors.  The global
 minor mode 'global-xref-mouse-mode' will enable this in all buffers.
+
++++
+*** New command 'xref-change-to-xref-edit-mode'.
+It's bound to "e" and it switches an Xref buffer into an "editable" mode
+like similar features in Occur and Grep buffers.
 
 ** Revert
 
@@ -4140,6 +4151,17 @@ change it globally with:
 
 ---
 *** Loading a file displays a warning if there is no 'lexical-binding' cookie.
+
+---
+** New function 'set-local'.
+This is the buffer local equivalent of the function 'set'.
+
++++
+** New macro 'setopt-local'.
+This is the buffer local version of 'setopt' for user options rather
+than plain variables and uses 'custom-set'/'set-local' to set variable
+values.  A new argument, BUFFER-LOCAL, is passed to 'custom-set'
+functions to indicate the buffer local context.
 
 +++
 ** New macros 'incf' and 'decf'.
