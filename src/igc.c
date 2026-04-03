@@ -1575,6 +1575,71 @@ scan_rdstack (mps_ss_t ss, void *start, void *end, void *closure)
 }
 
 static mps_res_t
+scan_prstack (mps_ss_t ss, void *start, void *end, void *closure)
+{
+  igc_assert (start == (void *) prstack.stack);
+  igc_assert (end == (void *) (prstack.stack + prstack.size));
+  igc_assert (closure == NULL);
+  MPS_SCAN_BEGIN (ss)
+  {
+    for (struct print_stack_entry *p = start, *q = end; p != q; p++)
+      {
+	if (p->type == PE_free)
+	  break;
+	switch (p->type)
+	  {
+	  case PE_free:
+	    emacs_abort ();
+
+	  case PE_list:
+	    IGC_FIX12_OBJ (ss, &p->u.list.last);
+	    IGC_FIX12_OBJ (ss, &p->u.list.tortoise);
+	    break;
+
+	  case PE_rbrac:
+	    break;
+
+	  case PE_vector:
+	    IGC_FIX12_OBJ (ss, &p->u.vector.obj);
+	    break;
+
+	  case PE_hash:
+	    IGC_FIX12_OBJ (ss, &p->u.hash.obj);
+	    break;
+	  }
+      }
+  }
+  MPS_SCAN_END (ss);
+  return 0;
+}
+
+static mps_res_t
+scan_ppstack (mps_ss_t ss, void *start, void *end,
+	      void *closure)
+{
+  eassert (start == (void *) ppstack.stack);
+  eassert (end == (void *) (ppstack.stack + ppstack.size));
+  eassert (closure == NULL);
+  MPS_SCAN_BEGIN (ss)
+  {
+    for (struct print_pp_entry *p = start, *q = end; p != q; ++p)
+      {
+	if (!p->is_in_use)
+	  break;
+	if (p->n == 0)
+	  IGC_FIX12_OBJ (ss, &p->u.value);
+	else
+	  {
+	    igc_assert (p->n > 0);
+	    IGC_FIX12_OBJ (ss, &p->u.vectorlike);
+	  }
+      }
+  }
+  MPS_SCAN_END (ss);
+  return 0;
+}
+
+static mps_res_t
 scan_specpdl (mps_ss_t ss, void *start, void *end, void *closure)
 {
   MPS_SCAN_BEGIN (ss)
@@ -1620,10 +1685,10 @@ scan_specpdl (mps_ss_t ss, void *start, void *end, void *closure)
 	  case SPECPDL_MODULE_RUNTIME:
 	    break;
 
-	    // If I am not mistaken, the emacs_env in this binding
-	    // actually lives on the stack (see module-load e.g.).
-	    // So, we don't have to do anything here for the Lisp
-	    // objects in emacs_env.
+	    /* If I am not mistaken, the emacs_env in this binding
+	       actually lives on the stack (see module-load e.g.).
+	       So, we don't have to do anything here for the Lisp
+	       objects in emacs_env.  */
 	  case SPECPDL_MODULE_ENVIRONMENT:
 	    break;
 #endif
@@ -1852,6 +1917,21 @@ scan_hash_table_user_test (mps_ss_t ss, void *start, void *end, void *closure)
   MPS_SCAN_END (ss);
   return MPS_RES_OK;
 }
+
+#if defined (HAVE_WEBP) || defined (HAVE_GIF)
+static mps_res_t
+scan_anim_cache (mps_ss_t ss, void *start, void *end, void *closure)
+{
+  struct anim_cache **anim_cache_var = start;
+  MPS_SCAN_BEGIN (ss)
+  {
+    for (struct anim_cache *c = *anim_cache_var; c; c = c->next)
+      IGC_FIX12_OBJ (ss, &c->spec);
+  }
+  MPS_SCAN_END (ss);
+  return MPS_RES_OK;
+}
+#endif  /* HAVE_WEBP || HAVE_GIF */
 
 #if defined (USE_GTK) && ! defined (HAVE_PGTK)
 /* scan_xg_pending_quit_event assumes that the fields of the input_event
@@ -2705,6 +2785,51 @@ fix_glyph_pool (mps_ss_t ss, struct glyph_pool *pool)
 }
 
 static mps_res_t
+fix_glyph_array (mps_ss_t ss, size_t len, struct glyph array[len])
+{
+  MPS_SCAN_BEGIN (ss)
+  {
+    /* Adjacent glyphs often have the same values in the object and
+       frame fields.  The code tries to recognize this to avoid some
+       calls to _mps_fix2.  */
+    Lisp_Object prev_obj = Qnil, prev_obj_fixed = Qnil;
+    struct frame *prev_frame = NULL, *prev_frame_fixed = NULL;
+    for (size_t i = 0; i != len; ++i)
+      {
+	struct glyph *glyph = array + i;
+	Lisp_Object obj = glyph->object;
+	if (!BASE_EQ (obj, prev_obj))
+	  {
+	    IGC_FIX12_OBJ (ss, &glyph->object);
+	    prev_obj = obj;
+	    prev_obj_fixed = glyph->object;
+	  }
+	else if (!BASE_EQ (obj, prev_obj_fixed))
+	  glyph->object = prev_obj_fixed;
+	else
+	  {
+	    /* not moved */
+	  }
+	struct frame *frame = glyph->frame;
+	if (frame != prev_frame)
+	  {
+	    IGC_FIX12_PVEC (ss, &glyph->frame);
+	    prev_frame = frame;
+	    prev_frame_fixed = glyph->frame;
+	  }
+	else if (frame != prev_frame_fixed)
+	  glyph->frame = prev_frame_fixed;
+	else
+	  {
+	    /* not moved */
+	  }
+      }
+  }
+  MPS_SCAN_END (ss);
+  return MPS_RES_OK;
+}
+
+static mps_res_t
 fix_glyph_matrix (mps_ss_t ss, struct glyph_matrix *matrix)
 {
   MPS_SCAN_BEGIN (ss)
@@ -2718,9 +2843,8 @@ fix_glyph_matrix (mps_ss_t ss, struct glyph_matrix *matrix)
 	  for (int area = LEFT_MARGIN_AREA; area < LAST_AREA; ++area)
 	    {
 	      struct glyph *glyph = row->glyphs[area];
-	      struct glyph *end_glyph = glyph + row->used[area];
-	      for (; glyph < end_glyph; ++glyph)
-		IGC_FIX12_OBJ (ss, &glyph->object);
+	      size_t len = row->used[area];
+	      IGC_FIX_CALL (ss, fix_glyph_array (ss, len, glyph));
 	    }
 	}
     IGC_FIX12_PVEC (ss, &matrix->buffer);
@@ -2789,10 +2913,12 @@ fix_window (mps_ss_t ss, struct window *w)
   MPS_SCAN_BEGIN (ss)
   {
     IGC_FIX_CALL_FN (ss, struct Lisp_Vector, w, fix_vectorlike);
+#if 0
     if (w->current_matrix && !w->current_matrix->pool)
       IGC_FIX_CALL (ss, fix_glyph_matrix (ss, w->current_matrix));
     if (w->desired_matrix && !w->desired_matrix->pool)
       IGC_FIX_CALL (ss, fix_glyph_matrix (ss, w->desired_matrix));
+#endif
   }
   MPS_SCAN_END (ss);
   return MPS_RES_OK;
@@ -3076,7 +3202,7 @@ fix_terminal (mps_ss_t ss, struct terminal *t)
   {
     IGC_FIX_CALL_FN (ss, struct Lisp_Vector, t, fix_vectorlike);
     IGC_FIX12_PVEC (ss, &t->next_terminal);
-    // These are malloc'd, so they can be accessed.
+    /* These are malloc'd, so they can be accessed.  */
     IGC_FIX_CALL_FN (ss, struct coding_system, t->keyboard_coding, fix_coding);
     IGC_FIX_CALL_FN (ss, struct coding_system, t->terminal_coding, fix_coding);
   }
@@ -3170,7 +3296,7 @@ fix_xwidget_view (mps_ss_t ss, struct xwidget_view *v)
   return MPS_RES_OK;
 }
 
-#endif // HAVE_XWIDGETS
+#endif /* HAVE_XWIDGETS */
 
 #ifdef HAVE_MODULES
 static mps_res_t
@@ -3360,15 +3486,6 @@ fix_vector (mps_ss_t ss, struct Lisp_Vector *v)
   return MPS_RES_OK;
 }
 
-igc_scan_result_t
-igc_fix12_obj (struct igc_ss *ssp, Lisp_Object *addr)
-{
-  mps_ss_t ss = (mps_ss_t) ssp;
-  MPS_SCAN_BEGIN (ss) { IGC_FIX12_OBJ (ss, addr); }
-  MPS_SCAN_END (ss);
-  return MPS_RES_OK;
-}
-
 #pragma GCC diagnostic pop
 
 static igc_root_list *
@@ -3439,6 +3556,18 @@ root_create_kbd_buffer (struct igc *gc)
 	       mps_rank_ambig (), scan_kbd_buffer_ambig, NULL,
 	       true, "kbd-buffer");
 }
+
+#if defined (HAVE_WEBP) || defined (HAVE_GIF)
+
+static void
+root_create_anim_cache (struct igc *gc)
+{
+  root_create (gc, &anim_cache, &anim_cache + 1, mps_rank_exact (),
+	       scan_anim_cache, NULL, false, "anim_cache");
+}
+
+#endif  /* HAVE_WEBP || HAVE_GIF */
+
 
 #if defined (USE_GTK) && ! defined (HAVE_PGTK)
 static void
@@ -3889,12 +4018,14 @@ igc_park_arena (void)
   return count;
 }
 
+/* This is called from lread.c:grow_read_stack.  */
 void
 igc_grow_rdstack (struct read_stack *rs)
 {
   struct igc *gc = global_igc;
   ptrdiff_t old_nitems = rs->size;
-  ptrdiff_t nbytes = xpalloc_nbytes (rs->stack, &rs->size, 1, -1, sizeof *rs->stack);
+  ptrdiff_t nbytes
+    = xpalloc_nbytes (rs->stack, &rs->size, 1, -1, sizeof *rs->stack);
   struct read_stack_entry *new_stack = xzalloc (nbytes);
   for (ptrdiff_t i = 0; i < rs->size; i++)
     new_stack[i].type = RE_free;
@@ -3922,7 +4053,8 @@ igc_grow_rdstack (struct read_stack *rs)
       temp.type = RE_free;
       new_stack[i] = temp;
       new_stack[i].type = orig.type;
-      eassert (memcmp ((void *) (&new_stack[i]), (void *) (&old_stack->stack[i]), sizeof orig) == 0);
+      eassert (memcmp ((void *) (&new_stack[i]),
+		       (void *) (&old_stack->stack[i]), sizeof orig) == 0);
     }
 
   igc_xfree (rs->stack);
@@ -3998,7 +4130,8 @@ igc_realloc_ambig (void *block, size_t size)
       eassert (memcmp ((void *) &word, old_pw + i, sizeof word) == 0);
       new_pw[i] = word;
     }
-  memcpy (new_pw + (min_size / sizeof (mps_word_t)), old_pw + (min_size / sizeof (mps_word_t)),
+  memcpy (new_pw + (min_size / sizeof (mps_word_t)),
+	  old_pw + (min_size / sizeof (mps_word_t)),
 	  min_size % sizeof (mps_word_t));
   igc_xfree (block);
   return p;
@@ -4039,10 +4172,10 @@ igc_xpalloc_ambig (void *old_pa, ptrdiff_t *nitems,
   return new_pa;
 }
 
-void
+static void
 igc_xpalloc_exact (void **pa_cell, ptrdiff_t *nitems,
 		   ptrdiff_t nitems_incr_min, ptrdiff_t nitems_max,
-		   ptrdiff_t item_size, igc_scan_area_t scan_area,
+		   ptrdiff_t item_size, mps_area_scan_t scan_area,
 		   void *closure)
 {
   void *old_pa = *pa_cell;
@@ -4052,8 +4185,8 @@ igc_xpalloc_exact (void **pa_cell, ptrdiff_t *nitems,
 				     nitems_max, item_size);
   void *new_pa = xzalloc (nbytes);
   char *end = (char *) new_pa + nbytes;
-  root_create (global_igc, new_pa, end, mps_rank_exact (), (mps_area_scan_t) scan_area,
-	       closure, false, "xpalloc-exact");
+  root_create (global_igc, new_pa, end, mps_rank_exact (),
+	       (mps_area_scan_t) scan_area, closure, false, "xpalloc-exact");
   for (ptrdiff_t i = 0; i < (old_nitems); i++)
     {
       igc_assert (item_size < MAX_ALLOCA);
@@ -4077,7 +4210,7 @@ igc_xpalloc_exact (void **pa_cell, ptrdiff_t *nitems,
   igc_xfree (old_pa);
 }
 
-void *
+static void *
 igc_xnrealloc_ambig (void *old_pa, ptrdiff_t nitems, ptrdiff_t item_size)
 {
   ptrdiff_t old_nbytes = 0;
@@ -4121,6 +4254,26 @@ igc_xpalloc_raw_exact (void *pa, ptrdiff_t *nitems,
   xfree (old);
   *nitems = nitems_new;
   return new;
+}
+
+void
+igc_grow_print_stack (struct print_stack *ps)
+{
+  ptrdiff_t old_size = ps->size;
+  igc_xpalloc_exact ((void **) &prstack.stack, &ps->size, 1, -1,
+		     sizeof *ps->stack, scan_prstack, NULL);
+  for (ptrdiff_t i = old_size; i < ps->size; ++i)
+    ps->stack[i].type = PE_free;
+}
+
+void
+igc_grow_pp_stack (struct print_pp_stack *ps)
+{
+  ptrdiff_t old_size = ps->size;
+  igc_xpalloc_exact ((void **) &ppstack.stack, &ps->size, 1, -1,
+		     sizeof *ps->stack, scan_ppstack, NULL);
+  for (ptrdiff_t i = old_size; i < ps->size; ++i)
+    ppstack.stack[i].is_in_use = false;
 }
 
 Lisp_Object *
@@ -4174,6 +4327,22 @@ igc_alloc_hash_table_user_test (void)
   root_create_exact (global_igc, ut, ut + 1, scan_hash_table_user_test,
 		     "hash-table-user-test");
   return ut;
+}
+
+static mps_res_t
+scan_glyph_matrix (mps_ss_t ss, void *start, void *end, void *closure)
+{
+  struct glyph_matrix *m = start;
+  return fix_glyph_matrix (ss, m);
+}
+
+struct glyph_matrix *
+igc_alloc_glyph_matrix (void)
+{
+  struct glyph_matrix *m = xzalloc (sizeof *m);
+  root_create_exact (global_igc, m, m + 1, scan_glyph_matrix,
+		     "glyph_matrix");
+  return m;
 }
 
 static void
@@ -5895,6 +6064,9 @@ make_igc (void)
   root_create_exact_ptr (gc, &all_threads);
   root_create_kbd_buffer (gc);
   root_create_exact_ptr (gc, &buffer_before_last_command_or_undo);
+#if defined (HAVE_WEBP) || defined (HAVE_GIF)
+  root_create_anim_cache (gc);
+#endif
 #if defined (USE_GTK) && ! defined (HAVE_PGTK)
   root_create_xg_pending_quit_event (gc);
 #endif

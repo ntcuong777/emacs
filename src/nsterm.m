@@ -8095,7 +8095,7 @@ ns_in_echo_area (void)
           struct input_event ie;
           EVENT_INIT (ie);
           ie.kind = MOVE_FRAME_EVENT;
-          XSETFRAME (ie.frame_or_window, emacsframe);
+          XSETFRAME (ie.frame_or_window, *emacsframe);
           XSETINT (ie.x, f->left_pos);
           XSETINT (ie.y, f->top_pos);
           kbd_buffer_store_event (&ie);
@@ -8364,7 +8364,7 @@ ns_in_echo_area (void)
   NSTRACE_MSG ("cols:%d lines:%d", f->text_cols, f->text_lines);
 
 #ifdef HAVE_MPS
-  emacsframe = igc_xalloc_raw_exact (1, __func__);
+  emacsframe = igc_xalloc_raw_exact (1, "emacsframe");
 #else
   emacsframe = xzalloc (sizeof *emacsframe);
 #endif
@@ -9179,11 +9179,11 @@ ns_in_echo_area (void)
 #else
   hide_bell();              // Ensure the bell image isn't scrolled.
 
-  ns_focus (emacsframe, &dstRect, 1);
+  ns_focus (*emacsframe, &dstRect, 1);
   [self scrollRect: srcRect
                 by: NSMakeSize (dstRect.origin.x - srcRect.origin.x,
                                 dstRect.origin.y - srcRect.origin.y)];
-  ns_unfocus (emacsframe);
+  ns_unfocus (*emacsframe);
 #endif
 }
 
@@ -10454,7 +10454,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 {
   NSTRACE ("[EmacsScroller initFrame: window:]");
 #ifdef HAVE_MPS
-  m_lisp_window = igc_xalloc_raw_exact (1, __func__);
+  m_lisp_window = igc_xalloc_raw_exact (1, "initFrame");
 #else
   m_lisp_window = xzalloc (sizeof *m_lisp_window);
 #endif
