@@ -2015,6 +2015,16 @@ package archive."
   :type 'boolean
   :version "29.1")
 
+(defun package--compatible-packages ()
+  "Return list of packages that can be installed.
+This excludes packages that are listed in the archives, but have
+incompatible dependencies (either not available at all or too old)."
+  (package-read-all-archive-contents)
+  (package--build-compatibility-table)
+  (cl-loop for (name . desc) in package-archive-contents
+           unless (any #'package--incompatible-p desc)
+           collect name))
+
 ;;;###autoload
 (defun package-install (pkg &optional dont-select interactive)
   "Install the package PKG.
@@ -2042,7 +2052,7 @@ had been enabled."
      (package--archives-initialize)
      (list (intern (completing-read
                     "Install package: "
-                    package-archive-contents
+                    (package--compatible-packages)
                     nil t))
            nil
            'interactive)))
@@ -2161,24 +2171,35 @@ from ELPA by either using `\\[package-upgrade]' or
 
 (defun package--dependencies (pkg)
   "Return a list of all transitive dependencies of PKG.
-If PKG is a package descriptor, the return value is a list of
-package descriptors.  If PKG is a symbol designating a package,
-the return value is a list of symbols designating packages."
+Each element of the resulting list is a cons-cell (NAME VERSION-LIST),
+where NAME is a symbol designating the package name and VERSION-LIST
+designates the least version number that any dependency of PKG requires.
+This format is intentionally meant to mirror that of
+`package-desc-reqs', which see.  PKG is either a symbol designating a
+package name known in the archives or a `package-desc' object."
   (when-let* ((desc (if (package-desc-p pkg) pkg
                       (cadr (assq pkg package-archive-contents)))))
     ;; Can we have circular dependencies?  Assume "nope".
-    (let ((all (named-let more ((pkg-desc desc))
-                 (let (deps)
-                   (dolist (req (package-desc-reqs pkg-desc))
-                     (setq deps (nconc
-                                 (catch 'found
-                                   (dolist (p (apply #'append (mapcar #'cdr (package--alist))))
-                                     (when (and (string= (car req) (package-desc-name p))
-                                                (version-list-<= (cadr req) (package-desc-version p)))
-                                       (throw 'found (more p)))))
-                                 deps)))
-                   (delete-dups (cons pkg-desc deps))))))
-      (remq pkg (mapcar (if (package-desc-p pkg) #'identity #'package-desc-name) all)))))
+    (let ((all (named-let rec ((pkg-desc desc) (min-version nil))
+                 (cl-loop for (name vlist) in (package-desc-reqs pkg-desc)
+                          if (eq name 'emacs)
+                          collect (list name vlist) into deps
+                          else append
+                          (cl-loop for p in (alist-get name package-archive-contents)
+                                   when (version-list-<= vlist (package-desc-version p))
+                                   return (rec p vlist)
+                                   ;; if we couldn't find a package in
+                                   ;; the archives, we fall back to
+                                   ;; returning the dependency as-is:
+                                   finally return (list (list name vlist)))
+                          into deps
+                          finally (return `((,(package-desc-name pkg-desc) ,min-version) . ,deps))))))
+      (mapcar
+       (lambda (ent)
+         (list (car ent) (seq-reduce (lambda (acc vlist)
+                                       (if (version-list-< acc vlist) vlist acc))
+                                     (mapcar #'cadr (cdr ent)) '())))
+       (seq-group-by #'car (delete-dups (cdr all)))))))
 
 (defun package-strip-rcs-id (str)
   "Strip RCS version ID from the version string STR.
@@ -2678,7 +2699,7 @@ Helper function for `describe-package'."
                     (cadr (assq pkg package-archive-contents))))))
          (name (if desc (package-desc-name desc) pkg))
          (pkg-dir (if desc (package-desc-dir desc)))
-         (reqs (if desc (package-desc-reqs desc)))
+         (reqs (if desc (package--dependencies desc)))
          (required-by (if desc (package--used-elsewhere-p desc nil 'all)))
          (version (if desc (package-desc-version desc)))
          (archive (if desc (package-desc-archive desc)))
@@ -2765,10 +2786,11 @@ Helper function for `describe-package'."
       (package--print-help-section "Summary"
         (package-desc-summary desc)))
 
-    (setq reqs (if desc (package-desc-reqs desc)))
+    (setq reqs (if desc (package--dependencies desc)))
     (when reqs
       (package--print-help-section "Requires")
-      (let ((first t))
+      (let ((immediate (package-desc-reqs desc))
+            (first t))
         (dolist (req reqs)
           (let* ((name (car req))
                  (vers (cadr req))
@@ -2783,7 +2805,9 @@ Helper function for `describe-package'."
                    (insert ",\n               "))
                   (t (insert ", ")))
             (help-insert-xref-button text 'help-package name)
-            (insert reason)))
+            (insert (if (assq name immediate) ""
+                      (propertize "*" 'help-echo "Transitive dependency"))
+                    reason)))
         (insert "\n")))
     (when required-by
       (package--print-help-section "Required by")
@@ -3256,7 +3280,7 @@ of these dependencies, similar to the list returned by
         (package-version-join version)
       (unless shallow
         (let (out)
-          (dolist (dep (package-desc-reqs pkg) out)
+          (dolist (dep (package--dependencies pkg) out)
             (let ((dep-name (car dep)))
               (unless (eq 'emacs dep-name)
                 (let ((cv (gethash dep-name package--compatibility-table)))
@@ -3945,8 +3969,9 @@ dependencies."
                    (apply
                     #'nconc
                     (mapcar (lambda (package)
-                              (package--dependencies
-                               (package-desc-name package)))
+                              (mapcar #'car
+                                      (package--dependencies
+                                       (package-desc-name package))))
                             packages))))))
             (if (and include-dependencies deps)
                 (if (length= deps 1)
