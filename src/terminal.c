@@ -699,8 +699,6 @@ init_initial_terminal (void)
 #else
   initial_terminal_lisp = make_lisp_ptr (create_terminal (output_initial, NULL), Lisp_Vectorlike);
 #endif
-  /* Note: menu-bar.el:menu-bar-update-buffers knows about this
-     special name of the initial terminal.  */
   initial_terminal->name = xstrdup ("initial_terminal");
   initial_terminal->kboard = initial_kboard;
   initial_terminal->delete_terminal_hook = &delete_initial_terminal;
