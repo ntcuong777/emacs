@@ -1827,15 +1827,15 @@ control over."
     (file-in-directory-p dir package-user-dir)))
 
 (defun package--removable-packages ()
-  "Return a list of names of packages no longer needed.
+  "Return a list of `package-desc' objects that are longer needed.
 These are packages which are neither contained in
 `package-selected-packages' nor a dependency of one that is."
   (let ((needed (package--get-deps package-selected-packages)))
-    (cl-loop for p in (mapcar #'car package-alist)
-             unless (or (memq p needed)
+    (cl-loop for (name . descs) in (package--alist)
+             unless (or (memq name needed)
                         ;; Do not auto-remove external packages.
-                        (not (package--user-installed-p p)))
-             collect p)))
+                        (not (package--user-installed-p name)))
+             append descs)))
 
 (defun package--used-elsewhere-p (pkg-desc &optional pkg-list all)
   "Non-nil if PKG-DESC is a dependency of a package in PKG-LIST.
@@ -2018,7 +2018,8 @@ package archive."
 (defun package--compatible-packages ()
   "Return list of packages that can be installed.
 This excludes packages that are listed in the archives, but have
-incompatible dependencies (either not available at all or too old)."
+incompatible dependencies (either too old or not available at all
+in any archive mentioned in `package-archives')."
   (package-read-all-archive-contents)
   (package--build-compatibility-table)
   (cl-loop for (name . desc) in package-archive-contents
@@ -2510,10 +2511,9 @@ argument, don't ask for confirmation to install packages."
                     (y-or-n-p
                      (format "Packages to delete: %d (%s), proceed? "
                              (length removable)
-                             (mapconcat #'symbol-name removable " "))))
-            (mapc (lambda (p)
-                    (package-delete (cadr (assq p package-alist)) t))
-                  removable))
+                             (mapconcat #'package-desc-full-name
+                              removable ", "))))
+            (mapc #'package-delete removable))
         (message "Nothing to autoremove")))))
 
 (defun package-isolate (packages &optional temp-init)
@@ -2712,8 +2712,8 @@ Helper function for `describe-package'."
          (status (if desc (package-desc-status desc) "orphan"))
          (incompatible-reason (package--incompatible-p desc))
          (signed (if desc (package-desc-signed desc)))
-         (maintainers (or (cdr (assoc :maintainer extras))
-                          (cdr (assoc :maintainers extras))))
+         (maintainers (ensure-proper-list (or (cdr (assoc :maintainer extras))
+                                              (cdr (assoc :maintainers extras)))))
          (authors (cdr (assoc :authors extras)))
          (news (and desc (package-find-news-file desc))))
     (when (string= status "avail-obso")
@@ -2847,8 +2847,6 @@ Helper function for `describe-package'."
         (insert " "))
       (insert "\n"))
     (when maintainers
-      (unless (and (listp (car maintainers)) (listp (cdr maintainers)))
-        (setq maintainers (list maintainers)))
       (package--print-help-section
           (if (cdr maintainers) "Maintainers" "Maintainer"))
       (dolist (maintainer maintainers)
@@ -3664,25 +3662,30 @@ Return (PKG-DESC [NAME VERSION STATUS DOC])."
 
 ;;; Package menu printing
 
+(defconst package-menu-status-faces
+  '(("built-in"   . package-status-built-in)
+    ("external"   . package-status-external)
+    ("available"  . package-status-available)
+    ("avail-obso" . package-status-avail-obso)
+    ("new"        . package-status-new)
+    ("held"       . package-status-held)
+    ("disabled"   . package-status-disabled)
+    ("installed"  . package-status-installed)
+    ("source"     . package-status-from-source)
+    ("dependency" . package-status-dependency)
+    ("unsigned"   . package-status-unsigned)
+    ("incompat"   . package-status-incompat)
+    ("obsolete"   . font-lock-warning-face))
+  "Alist mapping status strings for packages to faces.
+These faces are used in the package menu.")
+
 (defun package-menu--print-info-simple (pkg)
   "Return a package entry suitable for `tabulated-list-entries'.
 PKG is a `package-desc' object.
 Return (PKG-DESC [NAME VERSION STATUS DOC])."
   (let* ((status  (package-desc-status pkg))
-         (face (pcase status
-                 ("built-in"  'package-status-built-in)
-                 ("external"  'package-status-external)
-                 ("available" 'package-status-available)
-                 ("avail-obso" 'package-status-avail-obso)
-                 ("new"       'package-status-new)
-                 ("held"      'package-status-held)
-                 ("disabled"  'package-status-disabled)
-                 ("installed" 'package-status-installed)
-                 ("source"    'package-status-from-source)
-                 ("dependency" 'package-status-dependency)
-                 ("unsigned"  'package-status-unsigned)
-                 ("incompat"  'package-status-incompat)
-                 (_            'font-lock-warning-face)))) ; obsolete.
+         (face (alist-get status package-menu-status-faces
+                          nil nil #'string=)))
     (list pkg
           `[(,(symbol-name (package-desc-name pkg))
              face package-name
@@ -4864,9 +4867,8 @@ will be signaled in that case."
     (error "Invalid package description: %S" pkg-desc))
   (let* ((name (package-desc-name pkg-desc))
          (extras (package-desc-extras pkg-desc))
-         (maint (ensure-list
-                 (or (and-let* ((list (cdr (assoc :maintainer extras))))
-                       (if (consp (car-safe list)) list (list list)))
+         (maint (ensure-proper-list
+                 (or (cdr (assoc :maintainer extras))
                      (cdr (assoc :maintainers extras))
                      ;; If no maintainers are listed, contact authors
                      ;; instead (bug#80478)
