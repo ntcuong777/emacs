@@ -3016,6 +3016,7 @@ BODY is the backend specific code."
       (when (file-directory-p ,directory)
 	(seq-uniq (delq nil
          (let* ((case-fold-search read-file-name-completion-ignore-case)
+                remote-file-name-inhibit-cache
 		(result
 		 (if (tramp-tramp-file-p ,directory)
 		     (with-parsed-tramp-file-name
@@ -3027,16 +3028,14 @@ BODY is the backend specific code."
 			     (format
 			      "file-name-all-completions-%s"
 			      tramp-fnac-add-trailing-slash)
-			   ;; Mark symlinked directories.  Other
-			   ;; directories are already marked.
+			   ;; Mark directories, including symlinks to
+			   ;; directories.
 			   (mapcar
 			    (lambda (x)
 			      (let ((f (file-name-concat ,directory x)))
 				(if (and tramp-fnac-add-trailing-slash
 					 (not (string-suffix-p "/" x))
-					 (file-directory-p
-					  (if (file-symlink-p f)
-					      (file-truename f) f)))
+					 (file-directory-p f))
 				    (concat x "/") x)))
 			    ;; Some storage systems do not return "." and "..".
 			    (seq-union
