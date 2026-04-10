@@ -4520,9 +4520,17 @@ singleton list.
 ---
 ** Support macOS Accessibility Zoom focus tracking.
 This is an important change for visually-impaired users.  If macOS
-Accessibility Zoom is enabled (System Settings, Accessibility, Zoom)
-with keyboard focus tracking (Advanced...), Zoom is informed of updated
-cursor positions during each redisplay cycle.
+Accessibility Zoom is enabled via (System Settings, Accessibility,
+Zoom...)  with keyboard focus tracking (Advanced...), Zoom is informed
+of updated cursor positions during each redisplay cycle.
+
+---
+** New macOS function 'ns-process-is-accessibility-trusted'.
+This function returns t if the macOS Accessibility Framework trusts the
+Emacs.  This is a necessary condition for Accessibility Zoom and other
+accessibility features.  Enable Emacs via (System Settings, Privacy &
+Security, Accessibility...) and add the Emacs.app installed directory to
+the enabled application list.
 
 ---
 ** Process execution has been optimized on Android.
@@ -4629,6 +4637,18 @@ devices).
 Accordingly, we have revised our recommendations for a suitable DJGPP
 toolchain to GCC 14.2.0 and Binutils 2.35.1 in lieu of GCC 3.4.x and
 Binutils 2.26.
+
++++
+** Windows Terminal can now display 256 and 24-bit RGB color.
+Previously, terminal sessions on Windows supported display of 16 colors.
+There is now support for 8-bit (256 color) and 24-bit RGB (true color).
+The new mechanism will be enabled automatically when supported.
+It defaults to 24-bit RGB color, but can be set to 8, 16, '8bit, or '24bit
+by passing the '--color' flag or setting the 'tty-color-mode' frame parameter.
+Use of the new mechanism is controlled by an internal variable that can be
+set and inspected via the functions 'w32-use-virtual-terminal' and
+'w32-use-virtual-terminal-p' (respectively).  See the manual entry specific
+to MS-Windows for more details.
 
 
 ----------------------------------------------------------------------
