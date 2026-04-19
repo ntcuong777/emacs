@@ -721,26 +721,55 @@ case you are concerned about moving files between file systems."
   :type 'directory
   :version "31.1")
 
+(defconst package--review-git-diff-command
+  ;; Git's diff command can be used as a regular diff implementation
+  ;; with the --no-index flag.  The advantage is that the
+  ;; --diff-filter=d ignores files which are not present in the
+  ;; newly extracted archive.  This way, already compiled elc files
+  ;; are not shown as part of the diff for example.
+  '("git" "diff" "--no-index" "--no-color" "--diff-filter=d" "--minimal"
+    vc-git-diff-switches))
+
 (defcustom package-review-diff-command
-  (cons diff-command
-        (mapcar #'shell-quote-argument
-                '("-u"                  ;unified patch formatting
-                  "-N"                  ;treat absent files as empty
-                  "-x" "*.elc"          ;ignore byte compiled files
-                  "-x" "*-autoloads.el" ;ignore the autoloads file
-                  "-x" "*-pkg.el"       ;ignore the package description
-                  "-x" "*.info"         ;ignore compiled Info files
-                  )))
+  (if (executable-find "git")
+      package--review-git-diff-command
+    (list diff-command "-u" "-N"))
   "Configuration of how `package-review' should generate a Diff.
 The structure of the value must be (COMMAND . OPTIONS), where
 `diff-command' is rebound to be COMMAND and OPTIONS are command-line
-switches and arguments passed to `diff-no-select' as the SWITCHES argument
-if the user selects a diff-related option during review."
-  :type '(cons (string :tag "Diff command name")
-               (repeat :tag "Diff command-line arguments" string))
+switches and arguments passed to `diff-no-select' as the SWITCHES
+argument if the user selects a diff-related option during review.
+SWITCHES may additionally also include a symbol, which is replaced by
+the symbol value."
+  :type `(choice
+          (const :tag "Use git diff, excluding deleted files"
+                 ,package--review-git-diff-command)
+          (const :tag "Use diff, without exclusion" ("diff" "-u" "-N"))
+          (const :tag "Use diff, with exclusion of safe files"
+                 ,(cons diff-command
+                        (mapcar #'shell-quote-argument
+                                '("-u"                  ;unified patch formatting
+                                  "-N"                  ;treat absent files as empty
+                                  "-x" "*.elc"          ;ignore byte compiled files
+                                  "-x" "*-autoloads.el" ;ignore the autoloads file
+                                  "-x" "*-pkg.el"       ;ignore the package description
+                                  "-x" "*.info"         ;ignore compiled Info files
+                                  ))))
+          (cons :tag "Custom diff command"
+                (string :tag "Diff command name")
+                (repeat :tag "Diff command-line arguments"
+                        (or symbol string))))
   :version "31.1")
 
 (defun package-matches-selector-p (selector pkg-desc)
+  "Return non-nil if SELECTOR matches PKG-DESC.
+If SELECTOR is t the match always passes.  If SELECTOR is a list to a
+list you can specify a list of conditions.  An entry of the
+form (archive STRING) will match any packages from the archive
+STRING (see `package-archives'), and an entry of the form (package
+SYMBOL) will match any packages whose names match SYMBOL.  If any
+singular condition matches, then the entire selector matches PKG-DESC.
+If you prefix the list with a symbol `not', the rules are inverted."
   (let ((archive (package-desc-archive pkg-desc))
         (name (package-desc-name pkg-desc)))
     (pcase-exhaustive selector
@@ -773,7 +802,12 @@ review fails, the function throws a symbol `review-failed' with PKG-DESC
 attached."
   (let ((news (package-find-news-file pkg-desc))
         (enable-recursive-minibuffers t)
-        (diff-command (car package-review-diff-command)))
+        (diff-command (car package-review-diff-command))
+        (switches (cl-loop for switch in (cdr package-review-diff-command)
+                           when (stringp switch) collect switch into result
+                           when (and (symbolp switch) (boundp switch))
+                           append (ensure-list (symbol-value switch)) into result
+                           finally return (delq t result))))
     (while (pcase-exhaustive
                (car (read-multiple-choice
                      (format "Install \"%s\"?" (package-desc-name pkg-desc))
@@ -790,7 +824,7 @@ attached."
              (?d
               (display-buffer
                (diff-no-select
-                (package-desc-dir old-desc) pkg-dir (cdr package-review-diff-command) t
+                (package-desc-dir old-desc) pkg-dir switches t
                 (get-buffer-create (format "*Package Review Diff: %s*"
                                            (package-desc-full-name pkg-desc)))))
               t)
@@ -798,8 +832,7 @@ attached."
               (with-temp-buffer
                 (diff-no-select
                  (package-desc-dir old-desc) pkg-dir
-                 (cdr package-review-diff-command)
-                 t (current-buffer))
+                 switches t (current-buffer))
                 ;; delete sentinel message
                 (goto-char (point-max))
                 (forward-line -2)
@@ -2294,11 +2327,12 @@ directory."
           (setq default-directory file)
           (dired-mode))
       (insert-file-contents-literally file)
-      (set-visited-file-name file)
+      (set-visited-file-name file t)
       (set-buffer-modified-p nil)
       (when (string-match "\\.tar\\'" file) (tar-mode)))
     (unwind-protect
-        (package-install-from-buffer)
+        (with-silent-modifications
+          (package-install-from-buffer))
       (fundamental-mode))))             ; free auxiliary data
 
 ;;;###autoload
@@ -2348,6 +2382,9 @@ installed), maybe you need to \\[package-refresh-contents]")
   "Delete PKG-DESC directory DIR recursively.
 Clean-up the corresponding .eln files if Emacs is native
 compiled, and remove the DIR from `load-path'."
+  (when (and (file-exists-p (expand-file-name "dir" dir))
+             (boundp 'Info-directory-list))
+    (cl-callf2 delete dir Info-directory-list))
   (setq load-path (cl-remove-if (lambda (s) (file-in-directory-p s dir))
                                 load-path))
   (when (featurep 'native-compile)
@@ -3625,6 +3662,11 @@ Return (PKG-DESC [NAME VERSION STATUS DOC])."
   "Face used on the status and version of avail-obso packages."
   :version "25.1")
 
+(defface package-status-obsolete
+  '((t :inherit font-lock-warning-face))
+  "Face used on the status and version of obsolete packages."
+  :version "31.1")
+
 (defface package-mark-install-line
   '((((class color) (background light))
      :background "darkolivegreen1" :extend t)
@@ -3675,7 +3717,7 @@ Return (PKG-DESC [NAME VERSION STATUS DOC])."
     ("dependency" . package-status-dependency)
     ("unsigned"   . package-status-unsigned)
     ("incompat"   . package-status-incompat)
-    ("obsolete"   . font-lock-warning-face))
+    ("obsolete"   . package-status-obsolete))
   "Alist mapping status strings for packages to faces.
 These faces are used in the package menu.")
 
