@@ -756,12 +756,14 @@ enum ns_return_frame_mode
   CGColorSpaceRef colorSpace;
   IOSurfaceRef currentSurface;
   CGContextRef context;
+  NSMutableArray *invalidRectValues;
   bool doubleBuffered;
 }
 - (id) initWithDoubleBuffered: (bool)db;
 - (void) setColorSpace: (CGColorSpaceRef)cs;
 - (void) setDoubleBuffered: (bool)db;
 - (CGContextRef) getContext;
+- (void) invalidateRect: (NSRect)rect;
 @end
 #endif
 
