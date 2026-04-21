@@ -1372,11 +1372,56 @@ child_setup (int in, int out, int err, char **new_argv, char **env,
 static int
 emacs_posix_spawn_init_actions (posix_spawn_file_actions_t *actions,
                                 int std_in, int std_out, int std_err,
-                                const char *cwd)
+                                const char *cwd
+#ifdef NTCUONG_POSIX_SPAWN_PTY
+                                , const char *pty_name, bool pty_in,
+                                bool pty_out
+#endif /* NTCUONG_POSIX_SPAWN_PTY */
+                                )
 {
   int error = posix_spawn_file_actions_init (actions);
   if (error != 0)
     return error;
+
+#if defined DARWIN_OS && defined HAVE_PTYS && defined NTCUONG_POSIX_SPAWN_PTY
+  if (pty_name != NULL)
+    {
+      /* On Darwin/BSD, POSIX_SPAWN_SETSID makes the spawned process a session
+         leader.  Opening the slave PTY without O_NOCTTY after that triggers
+         BSD auto-CTTY behavior, making it the controlling terminal without
+         needing an ioctl(TIOCSCTTY) call in the child.  */
+      if (pty_in)
+        {
+          error = posix_spawn_file_actions_addopen (actions, STDIN_FILENO,
+                                                    pty_name, O_RDWR, 0);
+          if (error != 0)
+            goto out;
+          if (pty_out)
+            {
+              error = posix_spawn_file_actions_adddup2 (actions,
+                                                        STDIN_FILENO,
+                                                        STDOUT_FILENO);
+              if (error != 0)
+                goto out;
+            }
+        }
+      else
+        {
+          /* pty_out only.  */
+          error = posix_spawn_file_actions_addopen (actions, STDOUT_FILENO,
+                                                    pty_name, O_RDWR, 0);
+          if (error != 0)
+            goto out;
+        }
+      error = posix_spawn_file_actions_adddup2 (actions,
+                                                std_err < 0 ? STDOUT_FILENO
+                                                            : std_err,
+                                                STDERR_FILENO);
+      if (error != 0)
+        goto out;
+      goto ns_pty_skip_dup2;
+    }
+#endif /* DARWIN_OS && HAVE_PTYS && NTCUONG_POSIX_SPAWN_PTY */
 
   error = posix_spawn_file_actions_adddup2 (actions, std_in,
 					    STDIN_FILENO);
@@ -1394,6 +1439,10 @@ emacs_posix_spawn_init_actions (posix_spawn_file_actions_t *actions,
 					    STDERR_FILENO);
   if (error != 0)
     goto out;
+
+#if defined DARWIN_OS && defined HAVE_PTYS && defined NTCUONG_POSIX_SPAWN_PTY
+ ns_pty_skip_dup2: ;
+#endif /* DARWIN_OS && HAVE_PTYS && NTCUONG_POSIX_SPAWN_PTY */
 
   /* Haiku appears to have linkable posix_spawn_file_actions_chdir,
      but it always fails.  So use the _np function instead.  */
@@ -1525,7 +1574,14 @@ emacs_spawn (pid_t *newpid, int std_in, int std_out, int std_err,
      posix_spawn is used for all processes including PTY (see below).
      On other platforms fall back to vfork for PTY processes.  */
 #ifdef DARWIN_OS
+#ifdef NTCUONG_POSIX_SPAWN_PTY
+  /* On Darwin, BSD auto-CTTY behavior (open slave PTY without O_NOCTTY
+     after POSIX_SPAWN_SETSID) replaces fork+TIOCSCTTY, so posix_spawn
+     works for PTY processes too.  */
+  bool use_posix_spawn = true;
+#else
   bool use_posix_spawn = (pty_name == NULL);
+#endif /* NTCUONG_POSIX_SPAWN_PTY */
 # ifndef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
   use_posix_spawn = (use_posix_spawn
 		     && darwin_posix_spawn_file_actions_addchdir_np_func != NULL);
@@ -1546,9 +1602,23 @@ emacs_spawn (pid_t *newpid, int std_in, int std_out, int std_err,
 
   if (use_posix_spawn)
     {
+#if defined DARWIN_OS && defined HAVE_PTYS && defined NTCUONG_POSIX_SPAWN_PTY
+      /* Terminal setup must happen in the parent for the posix_spawn PTY
+         path.  Terminal attributes are device-wide, so the child's open of
+         the slave PTY inherits them.  */
+      if (pty_name != NULL && pty_out)
+        child_setup_tty (std_out);
+#endif
+
       /* Initialize optional attributes before blocking. */
+#ifdef NTCUONG_POSIX_SPAWN_PTY
+      int error = emacs_posix_spawn_init_actions (&actions, std_in,
+                                              std_out, std_err, cwd,
+                                              pty_name, pty_in, pty_out);
+#else
       int error = emacs_posix_spawn_init_actions (&actions, std_in,
                                               std_out, std_err, cwd);
+#endif
       if (error != 0)
 	return error;
 
