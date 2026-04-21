@@ -636,6 +636,27 @@ ns_release_autorelease_pool (void *pool)
   ns_release_object (pool);
 }
 
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+static void
+ns_note_invalid_rect (struct frame *f, NSRect rect)
+{
+  EmacsView *view = FRAME_NS_VIEW (f);
+  CALayer *layer = view ? [view layer] : nil;
+
+  if ([layer isKindOfClass:[EmacsLayer class]])
+    [(EmacsLayer *) layer invalidateRect:rect];
+}
+
+static void
+ns_note_invalid_rects (struct frame *f, NSRect *rects, int n)
+{
+  for (int i = 0; i < n; ++i)
+    ns_note_invalid_rect (f, rects[i]);
+}
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+#endif
+
 
 static BOOL
 ns_menu_bar_should_be_hidden (void)
@@ -1251,6 +1272,11 @@ ns_focus (struct frame *f, NSRect *r, int n)
   if (r != NULL)
     {
       NSTRACE_RECT ("r", *r);
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      ns_note_invalid_rects (f, r, n);
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+#endif
     }
 
   if (f != ns_updating_frame)
@@ -2934,6 +2960,15 @@ ns_clear_under_internal_border (struct frame *f)
       if (!face)
         return;
 
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      ns_note_invalid_rect (f, NSMakeRect (0, margin, width, border));
+      ns_note_invalid_rect (f, NSMakeRect (0, 0, border, height));
+      ns_note_invalid_rect (f, NSMakeRect (width - border, 0, border, height));
+      ns_note_invalid_rect (f, NSMakeRect (0, height - bottom_margin - border,
+					  width, border));
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+#endif
       ns_focus (f, NULL, 1);
       [[NSColor colorWithUnsignedLong:NS_FACE_BACKGROUND (face)] set];
       NSRectFill (NSMakeRect (0, margin, width, border));
@@ -3372,6 +3407,11 @@ ns_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
     ns_UAZoom_cursor_rect_new = r;
 #endif
 
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+  ns_note_invalid_rect (f, r);
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+#endif
   ns_focus (f, NULL, 0);
 
   NSGraphicsContext *ctx = [NSGraphicsContext currentContext];
@@ -4905,6 +4945,12 @@ ns_draw_glyph_string (struct glyph_string *s)
   /* Draw surrounding overhangs. */
   if (s->prev)
     {
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      NSRect r = NSMakeRect (s->x, s->y, s->width, s->height);
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+      ns_note_invalid_rect (s->f, r);
+#endif
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
       ns_focus (s->f, NULL, 0);
       struct glyph_string *prev;
 
@@ -4917,7 +4963,9 @@ ns_draw_glyph_string (struct glyph_string *s)
 	    enum draw_glyphs_face save = prev->hl;
 
 	    prev->hl = s->hl;
+#ifndef NTCUONG_NS_PARTIAL_IOSURFACE
 	    NSRect r = NSMakeRect (s->x, s->y, s->width, s->height);
+#endif
 	    NSRect rc;
 	    get_glyph_string_clip_rect (s, &rc);
 	    [[NSGraphicsContext currentContext] saveGraphicsState];
@@ -4946,6 +4994,12 @@ ns_draw_glyph_string (struct glyph_string *s)
 
   if (s->next)
     {
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      NSRect r = NSMakeRect (s->x, s->y, s->width, s->height);
+#if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
+      ns_note_invalid_rect (s->f, r);
+#endif
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
       ns_focus (s->f, NULL, 0);
       struct glyph_string *next;
 
@@ -4958,7 +5012,9 @@ ns_draw_glyph_string (struct glyph_string *s)
 	    enum draw_glyphs_face save = next->hl;
 
 	    next->hl = s->hl;
+#ifndef NTCUONG_NS_PARTIAL_IOSURFACE
 	    NSRect r = NSMakeRect (s->x, s->y, s->width, s->height);
+#endif
 	    NSRect rc;
 	    get_glyph_string_clip_rect (s, &rc);
 	    [[NSGraphicsContext currentContext] saveGraphicsState];
@@ -5978,6 +6034,11 @@ ns_term_init (Lisp_Object display_name)
   ns_pending_service_args = [[NSMutableArray alloc] init];
 
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+  if ([NSUserDefaults.standardUserDefaults
+        objectForKey:@"NSAutoFillHeuristicControllerEnabled"] == nil)
+    [NSUserDefaults.standardUserDefaults
+      registerDefaults:@{@"NSAutoFillHeuristicControllerEnabled" : @false}];
+
   /* Disable problematic event processing on macOS 26 (Tahoe) to avoid
      scrolling lag and input handling issues.  These are undocumented
      options as of macOS 26.0.  */
@@ -9289,6 +9350,9 @@ ns_in_echo_area (void)
 #if defined (NS_IMPL_COCOA) && MAC_OS_X_VERSION_MIN_REQUIRED >= 101400
   CGContextRef context = [(EmacsLayer *)[self layer] getContext];
   CGContextFlush (context);
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+  ns_note_invalid_rect (emacsframe, dstRect);
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
 
   double scale = [[self window] backingScaleFactor];
   int bpp = CGBitmapContextGetBitsPerPixel (context) / 8;
@@ -11056,6 +11120,13 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
    ========================================================================== */
 
+@interface EmacsLayer ()
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+- (void) copyContentsTo: (IOSurfaceRef) destination
+          usePartialCopy: (BOOL)usePartialCopy;
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+@end
+
 @implementation EmacsLayer
 
 
@@ -11090,6 +11161,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       [self setColorSpace:nil];
       [self setDoubleBuffered:db];
       cache = [[NSMutableArray arrayWithCapacity:(doubleBuffered ? 2 : 1)] retain];
+      invalidRectValues = [[NSMutableArray alloc] initWithCapacity:0];
     }
   else
     return nil;
@@ -11122,6 +11194,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 {
   [self releaseSurfaces];
   [cache release];
+  [invalidRectValues release];
 
   [super dealloc];
 }
@@ -11145,6 +11218,9 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
       [cache removeAllObjects];
     }
+
+  if (invalidRectValues)
+    [invalidRectValues removeAllObjects];
 }
 
 
@@ -11176,9 +11252,25 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   if (!context)
     {
       IOSurfaceRef surface = NULL;
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      NSUInteger surfaceIndex = NSNotFound;
+#endif
       int width = NSWidth ([self bounds]) * scale;
       int height = NSHeight ([self bounds]) * scale;
 
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      for (NSUInteger i = 0; i < [cache count]; ++i)
+        {
+          id object = [cache objectAtIndex:i];
+          if (!IOSurfaceIsInUse ((IOSurfaceRef)object))
+            {
+              surface = (IOSurfaceRef)object;
+              surfaceIndex = i;
+              [cache removeObjectAtIndex:i];
+              break;
+            }
+        }
+#else
       for (id object in cache)
         {
           if (!IOSurfaceIsInUse ((IOSurfaceRef)object))
@@ -11188,6 +11280,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
               break;
             }
         }
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
 
       if (!surface && [cache count] >= (doubleBuffered ? 2 : 1))
         {
@@ -11195,7 +11288,12 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
              in tearing effects.  The alternative is to wait for one
              of the surfaces to become free.  */
           surface = (IOSurfaceRef)[cache firstObject];
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+          surfaceIndex = 0;
+          [cache removeObjectAtIndex:0];
+#else
           [cache removeObject:(id)surface];
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
         }
       else if (!surface)
         {
@@ -11220,7 +11318,11 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
       if (lockStatus != kIOReturnSuccess)
         NSLog (@"Failed to lock surface: %x", (unsigned int)lockStatus);
 
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+      [self copyContentsTo:surface usePartialCopy:(surfaceIndex == 0)];
+#else
       [self copyContentsTo:surface];
+#endif
 
       currentSurface = surface;
 
@@ -11244,6 +11346,7 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 
       CGContextTranslateCTM(context, 0, IOSurfaceGetHeight (surface));
       CGContextScaleCTM(context, scale, -scale);
+      [invalidRectValues removeAllObjects];
     }
 
   return context;
@@ -11289,9 +11392,60 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
 }
 
 
+- (void) invalidateRect: (NSRect)rect
+{
+  if (!doubleBuffered || !invalidRectValues)
+    return;
+
+  NSUInteger count = invalidRectValues.count;
+
+  rect = NSIntersectionRect (rect, [self bounds]);
+  if (NSIsEmptyRect (rect))
+    return;
+
+  NSUInteger i;
+  for (i = 0; i < count; ++i)
+    {
+      NSRect current = [[invalidRectValues objectAtIndex:i] rectValue];
+      if (NSMinY (rect) <= NSMaxY (current))
+        break;
+    }
+
+  if (i == count)
+    {
+      [invalidRectValues addObject:[NSValue valueWithRect:rect]];
+      return;
+    }
+
+  NSRect current = [[invalidRectValues objectAtIndex:i] rectValue];
+  if (NSMaxY (rect) < NSMinY (current))
+    {
+      [invalidRectValues insertObject:[NSValue valueWithRect:rect] atIndex:i];
+      return;
+    }
+
+  NSUInteger insertIndex = i++;
+  rect = NSUnionRect (rect, current);
+  for (; i < count; ++i)
+    {
+      current = [[invalidRectValues objectAtIndex:i] rectValue];
+      if (NSMaxY (rect) < NSMinY (current))
+        break;
+      rect = NSUnionRect (rect, current);
+    }
+
+  [invalidRectValues replaceObjectAtIndex:insertIndex
+                               withObject:[NSValue valueWithRect:rect]];
+  if (i > insertIndex + 1)
+    [invalidRectValues removeObjectsInRange:
+                         NSMakeRange (insertIndex + 1, i - insertIndex - 1)];
+}
+
+
 /* Copy the contents of lastSurface to DESTINATION.  This is required
    every time we want to use an IOSurface as its contents are probably
    blanks (if it's new), or stale.  */
+#ifndef NTCUONG_NS_PARTIAL_IOSURFACE
 - (void) copyContentsTo: (IOSurfaceRef) destination
 {
   IOReturn lockStatus;
@@ -11321,6 +11475,74 @@ nswindow_orderedIndex_sort (id w1, id w2, void *c)
   if (lockStatus != kIOReturnSuccess)
     NSLog (@"Failed to unlock source surface: %x", (unsigned int)lockStatus);
 }
+#endif /* ! NTCUONG_NS_PARTIAL_IOSURFACE */
+
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+- (void) copyContentsTo: (IOSurfaceRef) destination
+          usePartialCopy: (BOOL)usePartialCopy
+{
+  IOReturn lockStatus;
+  IOSurfaceRef source = (IOSurfaceRef)[self contents];
+  void *sourceData, *destinationData;
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+  size_t numBytes = IOSurfaceGetAllocSize (destination);
+#else
+  int numBytes = IOSurfaceGetAllocSize (destination);
+#endif
+
+  NSTRACE_WHEN (NSTRACE_GROUP_FOCUS, "[EmacsLayer copyContentsTo:]");
+
+  if (!source || source == destination)
+    return;
+
+  lockStatus = IOSurfaceLock (source, kIOSurfaceLockReadOnly, nil);
+  if (lockStatus != kIOReturnSuccess)
+    NSLog (@"Failed to lock source surface: %x",
+	   (unsigned int) lockStatus);
+
+  sourceData = IOSurfaceGetBaseAddress (source);
+  destinationData = IOSurfaceGetBaseAddress (destination);
+
+#ifdef NTCUONG_NS_PARTIAL_IOSURFACE
+  if (!usePartialCopy || invalidRectValues.count == 0)
+    memcpy (destinationData, sourceData, numBytes);
+  else
+    {
+      CGFloat scale = [self contentsScale];
+      size_t bytesPerRow = IOSurfaceGetBytesPerRow (destination);
+
+      for (NSValue *value in invalidRectValues)
+        {
+          NSRect rect = NSIntersectionRect ([value rectValue], [self bounds]);
+          size_t x = lrint (NSMinX (rect) * scale);
+          size_t y = lrint (NSMinY (rect) * scale);
+          size_t width = lrint (NSWidth (rect) * scale);
+          size_t height = lrint (NSHeight (rect) * scale);
+
+          if (NSIsEmptyRect (rect) || width == 0 || height == 0)
+            continue;
+
+          char *src = (char *) sourceData + y * bytesPerRow + x * 4;
+          char *dest = (char *) destinationData + y * bytesPerRow + x * 4;
+          size_t rowBytes = width * 4;
+
+          for (size_t row = 0; row < height; ++row)
+            memcpy (dest + row * bytesPerRow,
+                    src + row * bytesPerRow, rowBytes);
+        }
+    }
+#else
+  /* Since every IOSurface should have the exact same settings, a
+     memcpy seems like the fastest way to copy the data from one to
+     the other.  */
+  memcpy (destinationData, sourceData, numBytes);
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
+
+  lockStatus = IOSurfaceUnlock (source, kIOSurfaceLockReadOnly, nil);
+  if (lockStatus != kIOReturnSuccess)
+    NSLog (@"Failed to unlock source surface: %x", (unsigned int)lockStatus);
+}
+#endif /* NTCUONG_NS_PARTIAL_IOSURFACE */
 
 #undef CACHE_MAX_SIZE
 
