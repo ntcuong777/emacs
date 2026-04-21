@@ -6411,6 +6411,9 @@ AC_SUBST([HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR])
 AC_SUBST([HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP])
 AC_SUBST([HAVE_POSIX_SPAWNATTR_SETFLAGS])
 AC_CHECK_DECLS([POSIX_SPAWN_SETSID], [], [], [[
+               /* On Darwin, POSIX_SPAWN_SETSID is gated behind
+                  _DARWIN_C_SOURCE in sys/spawn.h.  */
+               #define _DARWIN_C_SOURCE
                #include <spawn.h>
                ]])
 AC_SUBST([HAVE_DECL_POSIX_SPAWN_SETSID])
