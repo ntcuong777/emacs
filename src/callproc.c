@@ -1499,10 +1499,12 @@ emacs_posix_spawn_init_attributes (posix_spawnattr_t *attributes,
 
   /* Emacs ignores SIGPIPE, but the child should not.  */
   sigaddset (&sigdefault, SIGPIPE);
+#ifndef NTCUONG_NO_DUPLICATE_SIGPROF
   /* Likewise for SIGPROF.  */
 #ifdef SIGPROF
   sigaddset (&sigdefault, SIGPROF);
 #endif
+#endif /* ! NTCUONG_NO_DUPLICATE_SIGPROF */
 
   error = posix_spawnattr_setsigdefault (attributes, &sigdefault);
   if (error != 0)
@@ -1772,10 +1774,12 @@ emacs_spawn (pid_t *newpid, int std_in, int std_out, int std_err,
 
       /* Emacs ignores SIGPIPE, but the child should not.  */
       signal (SIGPIPE, SIG_DFL);
+#ifndef NTCUONG_NO_DUPLICATE_SIGPROF
       /* Likewise for SIGPROF.  */
 #ifdef SIGPROF
       signal (SIGPROF, SIG_DFL);
 #endif
+#endif /* ! NTCUONG_NO_DUPLICATE_SIGPROF */
 
 #ifdef subprocesses
       /* Stop blocking SIGCHLD in the child.  */
