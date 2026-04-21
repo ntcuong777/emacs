@@ -34,6 +34,36 @@ extern char **environ;
 
 /* In order to be able to use `posix_spawn', it needs to support some
    variant of `chdir' as well as `setsid'.  */
+#ifdef NTCUONG_POSIX_SPAWN_DARWIN
+/* On Darwin, availability of a variant of `chdir' is checked at
+   runtime so executables compiled on older versions can use
+   `posix_spawn' when running on Darwin 19 (macOS 10.15) or later.  */
+#if defined HAVE_SPAWN_H && defined HAVE_POSIX_SPAWN			\
+  && defined HAVE_POSIX_SPAWNATTR_SETFLAGS				\
+  && (defined DARWIN_OS							\
+      || ((defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR		\
+	   || defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP)	\
+	  && defined HAVE_DECL_POSIX_SPAWN_SETSID			\
+	  && HAVE_DECL_POSIX_SPAWN_SETSID == 1				\
+	  /* posix_spawnattr_setflags rejects POSIX_SPAWN_SETSID on	\
+	     Haiku */							\
+	  && !defined HAIKU))
+# include <spawn.h>
+# define USABLE_POSIX_SPAWN 1
+# ifdef DARWIN_OS
+#  ifndef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
+#   include <dlfcn.h>
+static int (*darwin_posix_spawn_file_actions_addchdir_np_func)
+  (posix_spawn_file_actions_t *, const char * __restrict);
+#  endif
+#  ifndef POSIX_SPAWN_SETSID
+#   define POSIX_SPAWN_SETSID 0x0400
+#  endif
+# endif
+#else
+# define USABLE_POSIX_SPAWN 0
+#endif
+#else /* ! NTCUONG_POSIX_SPAWN_DARWIN */
 #if defined HAVE_SPAWN_H && defined HAVE_POSIX_SPAWN        \
   && defined HAVE_POSIX_SPAWNATTR_SETFLAGS                  \
   && (defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR        \
@@ -48,6 +78,7 @@ extern char **environ;
 #else
 # define USABLE_POSIX_SPAWN 0
 #endif
+#endif /* NTCUONG_POSIX_SPAWN_DARWIN */
 
 #include "lisp.h"
 
@@ -1352,11 +1383,30 @@ emacs_posix_spawn_init_actions (posix_spawn_file_actions_t *actions,
 
   /* Haiku appears to have linkable posix_spawn_file_actions_chdir,
      but it always fails.  So use the _np function instead.  */
+#ifdef NTCUONG_POSIX_SPAWN_DARWIN
+#if defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR && !defined HAIKU
+ #if defined DARWIN_OS
+  if (__builtin_available (macos 26.0, *))
+ #endif
+    error = posix_spawn_file_actions_addchdir (actions, cwd);
+ #if defined DARWIN_OS
+  else
+    error = posix_spawn_file_actions_addchdir_np (actions, cwd);
+ #endif
+#elif defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
+  error = posix_spawn_file_actions_addchdir_np (actions, cwd);
+#elif defined DARWIN_OS
+  error = (*darwin_posix_spawn_file_actions_addchdir_np_func) (actions, cwd);
+#else
+  error = ENOSYS;
+#endif
+#else /* ! NTCUONG_POSIX_SPAWN_DARWIN */
 #if defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR && !defined HAIKU
   error = posix_spawn_file_actions_addchdir (actions, cwd);
 #else
   error = posix_spawn_file_actions_addchdir_np (actions, cwd);
 #endif
+#endif /* NTCUONG_POSIX_SPAWN_DARWIN */
   if (error != 0)
     goto out;
 
@@ -1456,11 +1506,26 @@ emacs_spawn (pid_t *newpid, int std_in, int std_out, int std_err,
 
 
 #if USABLE_POSIX_SPAWN
+#ifdef NTCUONG_POSIX_SPAWN_DARWIN
+  /* Prefer the simpler `posix_spawn' if available.  On Darwin,
+     posix_spawn is used for all processes including PTY (see below).
+     On other platforms fall back to vfork for PTY processes.  */
+#ifdef DARWIN_OS
+  bool use_posix_spawn = (pty_name == NULL);
+# ifndef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
+  use_posix_spawn = (use_posix_spawn
+		     && darwin_posix_spawn_file_actions_addchdir_np_func != NULL);
+# endif
+#else
+  bool use_posix_spawn = pty_name == NULL;
+#endif
+#else /* ! NTCUONG_POSIX_SPAWN_DARWIN */
   /* Prefer the simpler `posix_spawn' if available.  `posix_spawn'
      doesn't yet support setting up pseudoterminals, so we fall back
      to `vfork' if we're supposed to use a pseudoterminal.  */
 
   bool use_posix_spawn = pty_name == NULL;
+#endif /* NTCUONG_POSIX_SPAWN_DARWIN */
 
   posix_spawn_file_actions_t actions;
   posix_spawnattr_t attributes;
@@ -2064,6 +2129,20 @@ init_callproc (void)
 	dir_warning ("game dir", path_game);
     }
   Vshared_game_score_directory = gamedir;
+
+#ifdef NTCUONG_POSIX_SPAWN_DARWIN
+#if defined DARWIN_OS && !defined HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCHDIR_NP
+  darwin_posix_spawn_file_actions_addchdir_np_func = NULL;
+  void *handle = dlopen ("/usr/lib/system/libsystem_kernel.dylib",
+			 RTLD_LOCAL | RTLD_NODELETE);
+  if (handle)
+    {
+      darwin_posix_spawn_file_actions_addchdir_np_func
+	= dlsym (handle, "posix_spawn_file_actions_addchdir_np");
+      dlclose (handle);
+    }
+#endif
+#endif /* NTCUONG_POSIX_SPAWN_DARWIN */
 }
 
 void
