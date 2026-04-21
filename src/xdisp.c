@@ -2368,7 +2368,7 @@ pixel_to_glyph_coords (struct frame *f, int pix_x, int pix_y, int *x, int *y,
    text, or we can't tell because W's current matrix is not up to
    date.  */
 
-static struct glyph *
+struct glyph *
 x_y_to_hpos_vpos (struct window *w, int x, int y, int *hpos, int *vpos,
 		  int *dx, int *dy, int *area)
 {
@@ -2459,7 +2459,10 @@ x_y_to_column_row (struct window *w, int x, int y, int *column, int *row)
 /* Convert frame-relative x/y to coordinates relative to window W.
    Takes pseudo-windows into account.  */
 
-static void
+#ifndef HAVE_MACGUI
+static
+#endif
+void
 frame_to_window_pixel_xy (struct window *w, int *x, int *y)
 {
   if (w->pseudo_window_p)
@@ -14303,6 +14306,9 @@ prepare_menu_bars (void)
 	  update_tab_bar (f, false);
 #ifdef HAVE_WINDOW_SYSTEM
 	  update_tool_bar (f, false);
+#ifdef HAVE_MACGUI
+	  mac_update_title_bar (f, false);
+#endif
 #endif
 	}
 
@@ -14329,6 +14335,9 @@ prepare_menu_bars (void)
       update_tab_bar (sf, true);
 #ifdef HAVE_WINDOW_SYSTEM
       update_tool_bar (sf, true);
+#ifdef HAVE_MACGUI
+      mac_update_title_bar (sf, true);
+#endif
 #endif
     }
 }
@@ -14415,7 +14424,7 @@ update_menu_bar (struct frame *f, bool save_match_data, bool hooks_run, struct w
 #ifdef HAVE_EXT_MENU_BAR
 	  if (FRAME_WINDOW_P (f))
             {
-#if defined (HAVE_NS)
+#if defined HAVE_MACGUI || defined HAVE_NS
               /* All frames on Mac OS share the same menubar.  So only
                  the selected frame should be allowed to set it.  */
               if (f == SELECTED_FRAME ())
@@ -15595,11 +15604,20 @@ tty_handle_tab_bar_click (struct frame *f, int x, int y, bool down_p,
 static void
 update_tool_bar (struct frame *f, bool save_match_data)
 {
+  bool do_update;
+
 #ifdef HAVE_EXT_TOOL_BAR
-  bool do_update = FRAME_EXTERNAL_TOOL_BAR (f);
-#else
-  bool do_update = (WINDOWP (f->tool_bar_window)
-		    && WINDOW_TOTAL_LINES (XWINDOW (f->tool_bar_window)) > 0);
+#ifdef HAVE_INT_TOOL_BAR
+  if (!FRAME_WINDOW_P (f) || !FRAME_INTERNAL_TOOL_BAR_P (f))
+#endif
+    do_update = FRAME_EXTERNAL_TOOL_BAR (f);
+#ifdef HAVE_INT_TOOL_BAR
+  else
+#endif
+#endif
+#ifdef HAVE_INT_TOOL_BAR
+    do_update = (WINDOWP (f->tool_bar_window)
+		 && WINDOW_TOTAL_LINES (XWINDOW (f->tool_bar_window)) > 0);
 #endif
 
   if (do_update)
@@ -15681,7 +15699,7 @@ update_tool_bar (struct frame *f, bool save_match_data)
     }
 }
 
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
 
 /* Set F->desired_tool_bar_string to a Lisp string representing frame
    F's desired tool-bar contents.  F->tool_bar_items must have
@@ -16064,7 +16082,7 @@ tool_bar_height (struct frame *f, int *n_rows, bool pixelwise)
     return (it.current_y + FRAME_LINE_HEIGHT (f) - 1) / FRAME_LINE_HEIGHT (f);
 }
 
-#endif /* ! (HAVE_EXT_TOOL_BAR) */
+#endif /* HAVE_INT_TOOL_BAR */
 
 DEFUN ("tool-bar-height", Ftool_bar_height, Stool_bar_height,
        0, 2, 0,
@@ -16075,7 +16093,7 @@ PIXELWISE non-nil means return the height of the tool bar in pixels.  */)
 {
   int height = 0;
 
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
   struct frame *f = decode_any_frame (frame);
 
   if (WINDOWP (f->tool_bar_window)
@@ -16093,7 +16111,7 @@ PIXELWISE non-nil means return the height of the tool bar in pixels.  */)
   return make_fixnum (height);
 }
 
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
 
 /* Display the internal tool-bar of frame F.  Value is true if
    tool-bar's height should be changed.  */
@@ -16531,7 +16549,7 @@ note_tool_bar_highlight (struct frame *f, int x, int y)
     help_echo_string = AREF (f->tool_bar_items, prop_idx + TOOL_BAR_ITEM_CAPTION);
 }
 
-#endif /* ! (HAVE_EXT_TOOL_BAR) */
+#endif /* HAVE_INT_TOOL_BAR */
 
 #endif /* HAVE_WINDOW_SYSTEM */
 
@@ -17334,7 +17352,7 @@ redisplay_internal (void)
   if (!fr->glyphs_initialized_p)
     return;
 
-#if defined (USE_X_TOOLKIT) || defined (USE_GTK) || defined (HAVE_NS)
+#if defined USE_X_TOOLKIT || defined USE_GTK || defined HAVE_MACGUI || defined HAVE_NS
   if (popup_activated ())
     return;
 #endif
@@ -20671,6 +20689,9 @@ redisplay_window (Lisp_Object window, bool just_this_one_p)
       int new_vpos = -1;
 
       w->force_start = false;
+#ifdef HAVE_MACGUI // XXX
+      if (!mac_redisplay_dont_reset_vscroll)
+#endif
 
       /* The vscroll should be preserved in this case, since
 	 `pixel-scroll-precision-mode' must continue working normally
@@ -21479,14 +21500,25 @@ redisplay_window (Lisp_Object window, bool just_this_one_p)
 	    ignore_mouse_drag_p = true;
 
 #ifdef HAVE_EXT_TOOL_BAR
-	  if (FRAME_EXTERNAL_TOOL_BAR (f))
-	    update_frame_tool_bar (f);
-#else
-	  if (WINDOWP (f->tool_bar_window)
-	      && (FRAME_TOOL_BAR_LINES (f) > 0
-		  || !NILP (Vauto_resize_tool_bars))
-	      && redisplay_tool_bar (f))
-	    ignore_mouse_drag_p = true;
+#ifdef HAVE_INT_TOOL_BAR
+	  if (!FRAME_INTERNAL_TOOL_BAR_P (f))
+	    {
+#endif
+	      if (FRAME_EXTERNAL_TOOL_BAR (f))
+		update_frame_tool_bar (f);
+#ifdef HAVE_INT_TOOL_BAR
+	    }
+	  else
+#endif
+#endif
+#ifdef HAVE_INT_TOOL_BAR
+	    {
+	      if (WINDOWP (f->tool_bar_window)
+		  && (FRAME_TOOL_BAR_LINES (f) > 0
+		      || !NILP (Vauto_resize_tool_bars))
+		  && redisplay_tool_bar (f))
+		ignore_mouse_drag_p = true;
+	    }
 #endif
         }
       else
@@ -23680,7 +23712,7 @@ If there's no tool-bar, or if the tool-bar is not drawn by Emacs,
 do nothing.  */)
   (Lisp_Object row, Lisp_Object glyphs)
 {
-#if defined (HAVE_WINDOW_SYSTEM) && ! defined (HAVE_EXT_TOOL_BAR)
+#ifdef HAVE_INT_TOOL_BAR
   struct frame *sf = SELECTED_FRAME ();
   struct glyph_matrix *m = XWINDOW (sf->tool_bar_window)->current_matrix;
   EMACS_INT vpos;
@@ -24385,7 +24417,7 @@ extend_face_to_end_of_line (struct it *it)
       if (!(it->glyph_row->mode_line_p
 	    || (WINDOWP (f->tab_bar_window)
 		&& it->w == XWINDOW (f->tab_bar_window))
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
 	    || (WINDOWP (f->tool_bar_window)
 		&& it->w == XWINDOW (f->tool_bar_window))
 #endif
@@ -27564,6 +27596,10 @@ display_menu_bar (struct window *w)
   if (FRAME_X_P (f))
     return;
 #endif
+#ifdef HAVE_MACGUI
+  if (FRAME_MAC_P (f))
+    return;
+#endif
 
 #ifdef HAVE_NS
   if (FRAME_NS_P (f))
@@ -30593,7 +30629,7 @@ get_char_face_and_encoding (struct frame *f, int c, int face_id,
   *char2b = code & 0xFFFF;
 
   /* Make sure X resources of the face are allocated.  */
-#ifdef HAVE_X_WINDOWS
+#if defined HAVE_X_WINDOWS || defined HAVE_MACGUI
   if (display_p)
 #endif
     {
@@ -35281,7 +35317,7 @@ show_mouse_face (Mouse_HLInfo *hlinfo, enum draw_glyphs_face draw,
   if (FRAME_WINDOW_P (f) && NILP (track_mouse) && define_mouse_cursor)
     {
       if (draw == DRAW_NORMAL_TEXT
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
 	  && !EQ (hlinfo->mouse_face_window, f->tool_bar_window)
 #endif
 	  && !EQ (hlinfo->mouse_face_window, f->tab_bar_window))
@@ -35396,7 +35432,10 @@ cursor_in_mouse_face_p (struct window *w)
    covers these buffer positions.  This is similar to
    row_containing_pos, but is more accurate when bidi reordering makes
    buffer positions change non-linearly with glyph rows.  */
-static void
+#ifndef HAVE_MACGUI
+static
+#endif
+void
 rows_from_pos_range (struct window *w,
 		     ptrdiff_t start_charpos, ptrdiff_t end_charpos,
 		     Lisp_Object disp_string,
@@ -36705,7 +36744,7 @@ note_mouse_highlight (struct frame *f, int x, int y)
   struct buffer *b;
 
   /* When a menu is active, don't highlight because this looks odd.  */
-#if defined (HAVE_X_WINDOWS) || defined (HAVE_NS) || defined (MSDOS) \
+#if defined (HAVE_X_WINDOWS) || defined (HAVE_MACGUI) || defined (HAVE_NS) || defined (MSDOS) \
   || defined (HAVE_ANDROID)
   if (popup_activated ())
     return;
@@ -36741,8 +36780,10 @@ note_mouse_highlight (struct frame *f, int x, int y)
 	  && part != ON_TAB_LINE))
     clear_mouse_face (hlinfo);
 
+#ifndef HAVE_MACGUI
   /* Reset help_echo_string.  It will get recomputed below.  */
   help_echo_string = Qnil;
+#endif
 
   /* Handle tab-bar highlight on mouse-capable TTY frames.  */
   if (!FRAME_WINDOW_P (f)
@@ -36823,6 +36864,12 @@ note_mouse_highlight (struct frame *f, int x, int y)
   if (!WINDOWP (window))
     return;
 
+#ifdef HAVE_MACGUI
+  /* Reset help_echo_string here so as to avoid "sticky tooltip" due
+     to the early return above.  */
+  help_echo_string = Qnil;
+#endif
+
   /* Convert to window-relative pixel coordinates.  */
   w = XWINDOW (window);
   frame_to_window_pixel_xy (w, &x, &y);
@@ -36859,7 +36906,7 @@ note_mouse_highlight (struct frame *f, int x, int y)
     }
 #endif
 
-#if defined (HAVE_WINDOW_SYSTEM) && ! defined (HAVE_EXT_TOOL_BAR)
+#ifdef HAVE_INT_TOOL_BAR
   /* Handle tool-bar window differently since it doesn't display a
      buffer.  */
   if (EQ (window, f->tool_bar_window))
@@ -37679,7 +37726,13 @@ expose_window (struct window *w, const Emacs_Rectangle *fr)
   /* When we're currently updating the window, display and current
      matrix usually don't agree.  Arrange for a thorough display
      later.  */
-  if (w->must_be_updated_p)
+  if (
+#ifdef HAVE_MACGUI
+      w->being_updated_p
+#else
+      w->must_be_updated_p
+#endif
+      )
     {
       SET_FRAME_GARBAGED (f);
       return false;
@@ -37894,7 +37947,7 @@ expose_frame (struct frame *f, int x, int y, int w, int h)
     mouse_face_overwritten_p
       |= expose_window (XWINDOW (f->tab_bar_window), &r);
 
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
   if (WINDOWP (f->tool_bar_window))
     mouse_face_overwritten_p
       |= expose_window (XWINDOW (f->tool_bar_window), &r);

@@ -389,7 +389,9 @@ run_timers (void)
     {
       struct atimer *t = atimers;
       atimers = atimers->next;
+#ifndef DARWIN_OS
       t->fn (t);
+#endif
 
       if (t->type == ATIMER_CONTINUOUS)
 	{
@@ -401,6 +403,10 @@ run_timers (void)
 	  t->next = free_atimers;
 	  free_atimers = t;
 	}
+#ifdef DARWIN_OS
+      /* Fix for Ctrl-G.  Perhaps this should apply to all platforms. */
+      t->fn (t);
+#endif
     }
 
   set_alarm ();
@@ -414,6 +420,15 @@ static void
 handle_alarm_signal (int sig)
 {
   pending_signals = 1;
+#ifdef HAVE_MACGUI
+  mac_handle_alarm_signal ();
+#endif
+}
+
+static void
+deliver_alarm_signal (int sig)
+{
+  deliver_process_signal (sig, handle_alarm_signal);
 }
 
 #ifdef HAVE_TIMERFD
@@ -617,7 +632,7 @@ init_atimer (void)
 
   /* pending_signals is initialized in init_keyboard.  */
   struct sigaction action;
-  emacs_sigaction_init (&action, handle_alarm_signal);
+  emacs_sigaction_init (&action, deliver_alarm_signal);
   sigaction (SIGALRM, &action, 0);
 
 #ifdef ENABLE_CHECKING

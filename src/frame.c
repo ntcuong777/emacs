@@ -72,7 +72,7 @@ bool frame_garbaged;
 int frame_default_tab_bar_height;
 
 /* The default tool bar height for future frames.  */
-#ifdef HAVE_EXT_TOOL_BAR
+#if defined HAVE_EXT_TOOL_BAR && !defined HAVE_INT_TOOL_BAR
 enum { frame_default_tool_bar_height = 0 };
 #else
 int frame_default_tool_bar_height;
@@ -289,6 +289,7 @@ Value is:
   t for a termcap frame (a character-only terminal),
  `x' for an Emacs frame that is really an X window,
  `w32' for an Emacs frame that is a window on MS-Windows display,
+ `mac' for an Emacs frame on a Mac display,
  `ns' for an Emacs frame on a GNUstep or Macintosh Cocoa display,
  `pc' for a direct-write MS-DOS frame,
  `pgtk' for an Emacs frame running on pure GTK.
@@ -310,6 +311,8 @@ See also `frame-live-p'.  */)
       return Qw32;
     case output_msdos_raw:
       return Qpc;
+    case output_mac:
+      return Qmac;
     case output_ns:
       return Qns;
     case output_pgtk:
@@ -418,6 +421,7 @@ The value is a symbol:
  nil for a termcap frame (a character-only terminal),
  `x' for an Emacs frame that is really an X window,
  `w32' for an Emacs frame that is a window on MS-Windows display,
+ `mac' for an Emacs frame on a Mac display,
  `ns' for an Emacs frame on a GNUstep or Macintosh Cocoa display,
  `pc' for a direct-write MS-DOS frame.
  `pgtk' for an Emacs frame using pure GTK facilities.
@@ -1061,7 +1065,7 @@ adjust_frame_size (struct frame *f, int new_text_width, int new_text_height,
 	}
 #endif
 
-#if defined (HAVE_WINDOW_SYSTEM) && ! defined (HAVE_EXT_TOOL_BAR)
+#ifdef HAVE_INT_TOOL_BAR
       if (WINDOWP (f->tool_bar_window))
 	{
 	  XWINDOW (f->tool_bar_window)->pixel_width = new_inner_width;
@@ -1202,13 +1206,16 @@ make_frame (bool mini_p)
   f->face_cache = NULL;
   f->image_cache = NULL;
   f->last_tab_bar_item = -1;
-#ifndef HAVE_EXT_TOOL_BAR
+#ifdef HAVE_INT_TOOL_BAR
   f->last_tool_bar_item = -1;
   f->tool_bar_wraps_p = false;
 #endif
 #ifdef NS_IMPL_COCOA
   f->ns_appearance = ns_appearance_system_default;
   f->ns_transparent_titlebar = false;
+#endif
+#ifdef HAVE_MACGUI
+  f->mac_transparent_titlebar = false;
 #endif
 #endif
   f->select_mini_window_flag = false;
@@ -1764,8 +1771,12 @@ affects all frames on the same terminal device.  */)
     emacs_abort ();
 #else /* not MSDOS */
 
-#ifdef WINDOWSNT                           /* This should work now! */
-  if (!FRAME_TERMCAP_P (sf))
+#ifdef defined WINDOWSNT || defined HAVE_MACGUI /* This should work now! */
+  if (!FRAME_TERMCAP_P (sf)
+#ifdef HAVE_MACGUI
+      && sf->output_method != output_initial
+#endif
+      )
     error ("Not using an ASCII terminal now; cannot make a new ASCII frame");
 #endif
 #endif /* not MSDOS */
@@ -2874,6 +2885,10 @@ delete_frame (Lisp_Object frame, Lisp_Object force)
 
       pgtk_clear_frame_selections (f);
     }
+#endif
+#ifdef HAVE_MACGUI
+  if (FRAME_MAC_P (f))
+    mac_clear_frame_selections (f);
 #endif
 
   /* Free glyphs.
@@ -4884,6 +4899,9 @@ static const struct frame_parm_table frame_parms[] =
   {"ns-appearance",		SYMBOL_INDEX (Qns_appearance)},
   {"ns-transparent-titlebar",	SYMBOL_INDEX (Qns_transparent_titlebar)},
 #endif
+#ifdef HAVE_MACGUI
+  {"mac-transparent-titlebar",  SYMBOL_INDEX (Qmac_transparent_titlebar)},
+#endif
 };
 
 #ifdef HAVE_WINDOW_SYSTEM
@@ -5495,7 +5513,13 @@ gui_set_fullscreen (struct frame *f, Lisp_Object new_value, Lisp_Object old_valu
 {
   if (NILP (new_value))
     f->want_fullscreen = FULLSCREEN_NONE;
+#ifdef HAVE_MACGUI
+  else if (EQ (new_value, Qfullscreen))
+    f->want_fullscreen = FULLSCREEN_DEDICATED_DESKTOP;
+  else if (EQ (new_value, Qfullboth))
+#else
   else if (EQ (new_value, Qfullboth) || EQ (new_value, Qfullscreen))
+#endif
     f->want_fullscreen = FULLSCREEN_BOTH;
   else if (EQ (new_value, Qfullwidth))
     f->want_fullscreen = FULLSCREEN_WIDTH;
@@ -6041,7 +6065,7 @@ gui_set_scroll_bar_height (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 }
 
 #if (defined HAVE_PGTK || defined HAVE_NTGUI \
-     || defined HAVE_HAIKU || defined HAVE_NS)
+     || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_MACGUI)
 void
 gui_set_alpha (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 {
@@ -6157,6 +6181,7 @@ gui_mouse_grabbed (Display_Info *dpyinfo)
 	  && FRAME_LIVE_P (dpyinfo->last_mouse_frame));
 }
 
+#ifndef HAVE_MACGUI
 /* Re-highlight something with mouse-face properties
    on DPYINFO using saved frame and mouse position.  */
 
@@ -6169,6 +6194,8 @@ gui_redo_mouse_highlight (Display_Info *dpyinfo)
 			  dpyinfo->last_mouse_motion_x,
 			  dpyinfo->last_mouse_motion_y);
 }
+
+#endif /* !HAVE_MACGUI */
 
 /* Subroutines of creating an X frame.  */
 
@@ -7318,6 +7345,9 @@ syms_of_frame (void)
   DEFSYM (Qns_appearance, "ns-appearance");
   DEFSYM (Qns_transparent_titlebar, "ns-transparent-titlebar");
 #endif
+#ifdef HAVE_MACGUI
+  DEFSYM (Qmac_transparent_titlebar, "mac-transparent-titlebar");
+#endif
 
   DEFSYM (Qalpha, "alpha");
   DEFSYM (Qalpha_background, "alpha-background");
@@ -7451,7 +7481,7 @@ Setting this variable does not affect existing frames, only new ones.  */);
   DEFVAR_LISP ("default-frame-scroll-bars", Vdefault_frame_scroll_bars,
 	       doc: /* Default position of vertical scroll bars on this window-system.  */);
 #if defined HAVE_WINDOW_SYSTEM && !defined HAVE_ANDROID
-#if defined (HAVE_NTGUI) || defined (NS_IMPL_COCOA) || (defined (USE_GTK) && defined (USE_TOOLKIT_SCROLL_BARS))
+#if defined (HAVE_NTGUI) || defined (HAVE_MACGUI) || defined (NS_IMPL_COCOA) || (defined (USE_GTK) && defined (USE_TOOLKIT_SCROLL_BARS))
   /* MS-Windows, macOS, and GTK have scroll bars on the right by
      default.  */
   Vdefault_frame_scroll_bars = Qright;
@@ -7681,7 +7711,7 @@ implicitly.  Note also that when a frame is not large enough to
 accommodate a change of any of the parameters listed above, Emacs may
 try to enlarge the frame even if this option is non-nil.  */);
 #if defined (HAVE_WINDOW_SYSTEM) && !defined (HAVE_ANDROID)
-#if defined (USE_GTK) || defined (HAVE_NS)
+#if defined (USE_GTK) || defined HAVE_MACGUI || defined (HAVE_NS)
   frame_inhibit_implied_resize = list1 (Qtab_bar_lines);
 #else
   frame_inhibit_implied_resize = list2 (Qtab_bar_lines, Qtool_bar_lines);
