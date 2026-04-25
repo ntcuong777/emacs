@@ -2251,11 +2251,23 @@ usage: (make-process &rest ARGS)  */)
 	  && !(SCHARS (program) > 1
 	       && IS_DEVICE_SEP (SREF (program, 1))))
 	{
+#ifdef NTCUONG_CACHE_EXEC_PATH
+	  tem = exec_path_cache_lookup (program);
+	  if (NILP (tem))
+	    {
+	      openp (Vexec_path, program, Vexec_suffixes, &tem,
+		     make_fixnum (X_OK), false, false, NULL);
+	      if (NILP (tem))
+		report_file_error ("Searching for program", program);
+	      exec_path_cache_store (program, tem);
+	    }
+#else
 	  tem = Qnil;
 	  openp (Vexec_path, program, Fdefault_value (Qexec_suffixes), &tem,
 		 make_fixnum (X_OK), false, false, NULL);
 	  if (NILP (tem))
 	    report_file_error ("Searching for program", program);
+#endif /* NTCUONG_CACHE_EXEC_PATH */
 	  tem = Fexpand_file_name (tem, Qnil);
 	}
       else
