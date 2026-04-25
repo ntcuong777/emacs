@@ -130,6 +130,34 @@ static int (*darwin_posix_spawn_file_actions_addchdir_np_func)
 /* Pattern used by call-process-region to make temp files.  */
 static Lisp_Object Vtemp_file_name_pattern;
 
+#ifdef NTCUONG_CACHE_EXEC_PATH
+/* Cache mapping program name (Lisp string) to raw openp result.
+   Shared between call-process and start-process.  Invalidated
+   whenever exec-path identity changes (reassignment).  */
+static Lisp_Object exec_path_cache;
+static Lisp_Object exec_path_cache_key;
+
+Lisp_Object
+exec_path_cache_lookup (Lisp_Object program)
+{
+  if (NILP (exec_path_cache) || !EQ (exec_path_cache_key, Vexec_path))
+    return Qnil;
+  return Fgethash (program, exec_path_cache, Qnil);
+}
+
+void
+exec_path_cache_store (Lisp_Object program, Lisp_Object path)
+{
+  if (NILP (exec_path_cache) || !EQ (exec_path_cache_key, Vexec_path))
+    {
+      exec_path_cache = CALLN (Fmake_hash_table, QCtest, Qequal,
+			       QCsize, make_fixnum (64));
+      exec_path_cache_key = Vexec_path;
+    }
+  Fputhash (program, path, exec_path_cache);
+}
+#endif /* NTCUONG_CACHE_EXEC_PATH */
+
 /* The next two variables are used while record-unwind-protect is in place
    during call-process for a subprocess for which record_deleted_pid has
    not yet been called.  At other times, synch_process_pid is zero and
@@ -549,12 +577,25 @@ call_process (ptrdiff_t nargs, Lisp_Object *args, int filefd,
 
   /* Search for program; barf if not found.  */
   {
+#ifdef NTCUONG_CACHE_EXEC_PATH
+    /* Use the exec-path cache to avoid repeated PATH walks for the same binary.  */
+    path = exec_path_cache_lookup (args[0]);
+    if (NILP (path))
+      {
+	int ok = openp (Vexec_path, args[0], Vexec_suffixes, &path,
+			make_fixnum (X_OK), false, false, NULL);
+	if (ok < 0)
+	  report_file_error ("Searching for program", args[0]);
+	exec_path_cache_store (args[0], path);
+      }
+#else
     int ok;
 
     ok = openp (Vexec_path, args[0], Vexec_suffixes, &path,
 		make_fixnum (X_OK), false, false, NULL);
     if (ok < 0)
       report_file_error ("Searching for program", args[0]);
+#endif /* NTCUONG_CACHE_EXEC_PATH */
   }
 
   /* Remove "/:" from PATH.  */
@@ -2266,6 +2307,10 @@ syms_of_callproc (void)
   Vtemp_file_name_pattern = build_string ("emXXXXXX");
 #endif
   staticpro (&Vtemp_file_name_pattern);
+#ifdef NTCUONG_CACHE_EXEC_PATH
+  staticpro (&exec_path_cache);
+  staticpro (&exec_path_cache_key);
+#endif
 
 #ifdef MSDOS
   synch_process_tempfile = make_fixnum (0);

@@ -309,6 +309,11 @@ extern Lisp_Object network_interface_info (Lisp_Object);
 
 extern Lisp_Object remove_slash_colon (Lisp_Object);
 
+#ifdef NTCUONG_CACHE_EXEC_PATH
+extern Lisp_Object exec_path_cache_lookup (Lisp_Object program);
+extern void exec_path_cache_store (Lisp_Object program, Lisp_Object path);
+#endif
+
 extern void update_processes_for_thread_death (Lisp_Object);
 extern void dissociate_controlling_tty (void);
 
