@@ -241,10 +241,11 @@ buffers."
 
   ;; The foregoing commands in `diff-mode-shared-map' and
   ;; `diff-mode-read-only-map' don't affect buffers beyond this one.
-  ;; The following command is the only one that has a single-character
-  ;; binding and which affects buffers beyond this one.  However, the
-  ;; following command asks for confirmation by default, so that seems
-  ;; okay.  --spwhitton
+  ;; The following commands are the only ones that have a
+  ;; single-character binding and which affect something beyond the
+  ;; current buffer.  However, the following commands ask for
+  ;; confirmation by default, so that seems okay.  --spwhitton
+  "v" #'vc-next-action
   "u" #'diff-revert-and-kill-hunk
   ;; `diff-revert-and-kill-hunk' is the `diff-mode' analogue of what '@'
   ;; does in VC-Dir, so give it the same short binding.
@@ -1713,8 +1714,11 @@ else cover the whole buffer."
   "Major mode for viewing/editing context diffs.
 Supports unified and context diffs as well as, to a lesser extent, diffs
 in the old \"normal\" format.  (Unified diffs have become the standard,
-most commonly encountered format.)  If you edit the buffer manually,
-`diff-mode' will try to update the hunk headers for you on-the-fly.
+most commonly encountered format.)
+
+When the buffer is read-only, the ESC prefix is not necessary.
+If you edit the buffer manually, `diff-mode' will try to update the hunk
+headers for you on-the-fly.
 
 You can also switch between context diff and unified diff with \\[diff-context->unified],
 or vice versa with \\[diff-unified->context] and you can also reverse the direction of

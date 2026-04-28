@@ -101,15 +101,15 @@
 ;;           new URLSearchParams({
 ;;                 url: location.href,
 ;;                 title: document.title,
-;;                 body: window.getSelection()})
+;;                 body: window.getSelection()});void(0)
 ;;
 ;; Alternatively use the following expression that encodes space as \"%20\"
 ;; instead of \"+\", so it is compatible with Org versions from 9.0 to 9.4:
 ;;
-;;     location.href='org-protocol://sub-protocol?url='+
+;;     javascript:location.href='org-protocol://sub-protocol?url='+
 ;;           encodeURIComponent(location.href)+'&title='+
 ;;           encodeURIComponent(document.title)+'&body='+
-;;           encodeURIComponent(window.getSelection())
+;;           encodeURIComponent(window.getSelection());void(0)
 ;;
 ;; The handler for the sub-protocol \"capture\" detects an optional template
 ;; char that, if present, triggers the use of a special template.
@@ -437,14 +437,14 @@ also recognized.
 The location for a browser's bookmark may look like this:
 
   javascript:location.href = \\='org-protocol://store-link?\\=' +
-       new URLSearchParams({url:location.href, title:document.title});
+       new URLSearchParams({url:location.href, title:document.title});void(0);
 
 or to keep compatibility with Org versions from 9.0 to 9.4 it may be:
 
   javascript:location.href = \\
       \\='org-protocol://store-link?url=\\=' + \\
       encodeURIComponent(location.href) + \\='&title=\\=' + \\
-      encodeURIComponent(document.title);
+      encodeURIComponent(document.title);void(0);
 
 Don't use `escape()'!  Use `encodeURIComponent()' instead.  The
 title of the page could contain slashes and the location
@@ -482,20 +482,21 @@ by `/'.  The location for a browser's bookmark looks like this:
         new URLSearchParams({
               url: location.href,
               title: document.title,
-              body: window.getSelection()})
+              body: window.getSelection()});void(0)
 
 or to keep compatibility with Org versions from 9.0 to 9.4:
 
   javascript:location.href = \\='org-protocol://capture?url=\\='+ \\
         encodeURIComponent(location.href) + \\='&title=\\=' + \\
         encodeURIComponent(document.title) + \\='&body=\\=' + \\
-        encodeURIComponent(window.getSelection())
+        encodeURIComponent(window.getSelection());void(0)
 
 By default, it uses the character `org-protocol-default-template-key',
 which should be associated with a template in `org-capture-templates'.
 You may specify the template with a template= query parameter, like this:
 
-  javascript:location.href = \\='org-protocol://capture?template=b\\='+ ...
+  javascript:location.href
+        = \\='org-protocol://capture?template=b\\='+ ...;void(0)
 
 Now template ?b will be used."
   (let* ((parts
@@ -556,13 +557,13 @@ in `org-protocol-project-alist'.
 The location for a browser's bookmark should look like this:
 
   javascript:location.href = \\='org-protocol://open-source?\\=' +
-        new URLSearchParams({url: location.href})
+        new URLSearchParams({url: location.href});void(0)
 
 or if you prefer to keep compatibility with older Org versions (9.0 to 9.4),
 consider the following expression:
 
   javascript:location.href = \\='org-protocol://open-source?url=\\=' + \\
-        encodeURIComponent(location.href)"
+        encodeURIComponent(location.href);void(0)"
   ;; As we enter this function for a match on our protocol, the return value
   ;; defaults to nil.
   (let (;; (result nil)
@@ -621,7 +622,7 @@ consider the following expression:
 
 ;;; Core functions:
 
-(defun org-protocol-check-filename-for-protocol (fname restoffiles _client)
+(defun org-protocol-check-filename-for-protocol (fname restoffiles client)
   "Check if `org-protocol-the-protocol' and a valid protocol are used in FNAME.
 Sub-protocols are registered in `org-protocol-protocol-alist' and
 `org-protocol-protocol-alist-default'.  This is how the matching is done:
@@ -662,7 +663,10 @@ CLIENT is ignored."
                        (split (split-string fname proto))
                        (result (if greedy restoffiles (cadr split)))
 		       (new-style (not (= ?: (aref (match-string 1 fname) 0)))))
-                  (when (plist-get (cdr prolist) :kill-client)
+		  ;; Emacs Mac port directly handles `org-protocol'
+		  ;; URLs without the help of external commands or
+		  ;; apps.  In this case, `client' is set to nil.
+                  (when (and client (plist-get (cdr prolist) :kill-client))
 		    (message "Greedy org-protocol handler.  Killing client.")
 		    ;; If not fboundp, there's no client to kill.
 		    (if (fboundp 'server-edit) (server-edit)))

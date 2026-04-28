@@ -47,7 +47,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #ifdef HAVE_XINPUT2
 #include <X11/extensions/XInput2.h>
 #endif
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
 #include "nsxwidget.h"
 #endif
 
@@ -79,13 +79,13 @@ static GdkWindow *pick_embedded_child (GdkWindow *, double, double, gpointer);
 static struct xwidget *
 allocate_xwidget (void)
 {
-  return ALLOCATE_PSEUDOVECTOR (struct xwidget, script_callbacks, PVEC_XWIDGET);
+  return ALLOCATE_ZEROED_PSEUDOVECTOR (struct xwidget, script_callbacks, PVEC_XWIDGET);
 }
 
 static struct xwidget_view *
 allocate_xwidget_view (void)
 {
-  return ALLOCATE_PSEUDOVECTOR (struct xwidget_view, w, PVEC_XWIDGET_VIEW);
+  return ALLOCATE_ZEROED_PSEUDOVECTOR (struct xwidget_view, w, PVEC_XWIDGET_VIEW);
 }
 
 #define XSETXWIDGET(a, b) XSETPSEUDOVECTOR (a, b, PVEC_XWIDGET)
@@ -452,7 +452,7 @@ fails.  */)
 
       unblock_input ();
     }
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_init (xw);
 #endif
 
@@ -2760,7 +2760,7 @@ xwidget_init_view (struct xwidget *xww,
   xv->frame = s->f;
   xv->cursor = cursor_for_hit (xww->hit_result, s->f);
   xv->just_resized = false;
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_init_view (xv, xww, s, x, y);
   nsxwidget_resize_view(xv, xww->width, xww->height);
 #endif
@@ -2793,7 +2793,7 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
     xv = xwidget_init_view (xww, s, x, y);
 
   xv->just_resized = false;
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   if (!xv)
     {
       /* Enforce 1 to 1, model and view for macOS Cocoa webkit2.  */
@@ -2927,7 +2927,7 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
       gtk_fixed_move (GTK_FIXED (FRAME_GTK_WIDGET (xv->frame)),
 		      xv->widget, x + clip_left, y + clip_top);
       gtk_widget_queue_allocate (xv->widget);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
       nsxwidget_move_view (xv, x + clip_left, y + clip_top);
 #endif
     }
@@ -2969,7 +2969,7 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
 		      xv->widget, x + clip_left, y + clip_top);
       gtk_widget_queue_allocate (xv->widget);
 #endif
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
       nsxwidget_resize_view (xv, clip_right - clip_left,
                              clip_bottom - clip_top);
       nsxwidget_move_widget_in_view (xv, -clip_left, -clip_top);
@@ -2992,7 +2992,7 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
 	{
 #ifdef USE_GTK
 	  gtk_widget_queue_draw (xww->widget_osr);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
 	  nsxwidget_set_needsdisplay (xv);
 #endif
 	}
@@ -3041,7 +3041,7 @@ DEFUN ("xwidget-webkit-uri",
   if (!uri)
     return build_string ("");
   return build_string (uri);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   return nsxwidget_webkit_uri (xw);
 #endif
 }
@@ -3058,7 +3058,7 @@ DEFUN ("xwidget-webkit-title",
   const gchar *title = webkit_web_view_get_title (wkwv);
 
   return build_string (title ? title : "");
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   return nsxwidget_webkit_title (xw);
 #endif
 }
@@ -3084,7 +3084,7 @@ is to completely loading its page.  */)
 #ifdef USE_GTK
   webview = WEBKIT_WEB_VIEW (xw->widget_osr);
   value = webkit_web_view_get_estimated_load_progress (webview);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   value = nsxwidget_webkit_estimated_load_progress (xw);
 #endif
 
@@ -3105,7 +3105,7 @@ DEFUN ("xwidget-webkit-goto-uri",
 #ifdef USE_GTK
   webkit_web_view_load_uri (WEBKIT_WEB_VIEW (xw->widget_osr), SSDATA (uri));
   catch_child_signal ();
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_webkit_goto_uri (xw, SSDATA (uri));
 #endif
   return Qnil;
@@ -3141,8 +3141,8 @@ REL-POSth element around the current spot in the load history. */)
 
       webkit_web_view_go_to_back_forward_list_item (wkwv, it);
     }
-#elif defined NS_IMPL_COCOA
-  nsxwidget_webkit_goto_history (xw, XFIXNAT (rel_pos));
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
+  nsxwidget_webkit_goto_history (xw, XFIXNUM (rel_pos));
 #endif
   return Qnil;
 }
@@ -3162,7 +3162,7 @@ DEFUN ("xwidget-webkit-zoom",
         (WEBKIT_WEB_VIEW (xw->widget_osr),
          webkit_web_view_get_zoom_level
          (WEBKIT_WEB_VIEW (xw->widget_osr)) + zoom_change);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
       nsxwidget_webkit_zoom (xw, zoom_change);
 #endif
     }
@@ -3222,7 +3222,7 @@ argument procedure FUN.*/)
                                   NULL, /* cancelable */
                                   webkit_javascript_finished_cb,
 				  (gpointer) idx);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_webkit_execute_script (xw, SSDATA (script), fun);
 #endif
   return Qnil;
@@ -3273,7 +3273,7 @@ DEFUN ("xwidget-resize", Fxwidget_resize, Sxwidget_resize, 3, 3, 0,
 
       gtk_widget_queue_allocate (GTK_WIDGET (xw->widget_osr));
     }
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_resize (xw);
 #endif
   unblock_input ();
@@ -3297,7 +3297,7 @@ Emacs allocated area accordingly.  */)
   GtkRequisition requisition;
   gtk_widget_size_request (XXWIDGET (xwidget)->widget_osr, &requisition);
   return list2i (requisition.width, requisition.height);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   return nsxwidget_get_size (XXWIDGET (xwidget));
 #endif
 }
@@ -3418,7 +3418,7 @@ DEFUN ("delete-xwidget-view",
 
       gdk_offscreen_window_set_embedder (w, NULL);
     }
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_delete_view (xv);
 #endif
 
@@ -3895,7 +3895,7 @@ XWIDGET as part of loading a page.  */)
 #ifdef USE_GTK
   webview = WEBKIT_WEB_VIEW (xw->widget_osr);
   webkit_web_view_stop_loading (webview);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_webkit_stop_loading (xw);
 #endif
   unblock_input ();
@@ -4170,7 +4170,7 @@ xwidget_end_redisplay (struct window *w, struct glyph_matrix *matrix)
                 {
 #ifdef USE_GTK
                   xwidget_show_view (xv);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
                   nsxwidget_show_view (xv);
 #endif
                 }
@@ -4178,7 +4178,7 @@ xwidget_end_redisplay (struct window *w, struct glyph_matrix *matrix)
                 {
 #ifdef USE_GTK
                   xwidget_hide_view (xv);
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
                   nsxwidget_hide_view (xv);
 #endif
                 }
@@ -4203,7 +4203,7 @@ lower_frame_xwidget_views (struct frame *f)
 }
 #endif
 
-#ifndef NS_IMPL_COCOA
+#if !defined HAVE_MACGUI && !defined NS_IMPL_COCOA
 void
 kill_frame_xwidget_views (struct frame *f)
 {
@@ -4258,7 +4258,7 @@ kill_xwidget (struct xwidget *xw)
   xw->find_text = NULL;
 
   catch_child_signal ();
-#elif defined NS_IMPL_COCOA
+#elif defined HAVE_MACGUI || defined NS_IMPL_COCOA
   nsxwidget_kill (xw);
 #endif
 }
