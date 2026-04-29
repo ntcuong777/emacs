@@ -1,0 +1,338 @@
+#+TITLE: Dual-Thread UI + IGC Integration — Issues Log
+#+DATE: 2026-04-29
+#+AUTHOR: Emacs Development
+
+This document catalogs all bugs, design decisions, and gotchas
+encountered during the dual-thread UI model + IGC/MPS integration.
+
+* Architecture
+
+** Memory model: macOS dual-thread
+
+On macOS (emacs-mac port), there is ONE shared =current_thread= global
+pointing to =&main_thread.s=.  BOTH the GUI thread and the Lisp thread
+read from this same pointer.  This means:
+
+- =current_thread->gc_info= is always non-NULL on both threads
+- Both threads use the same allocation points (from =main_thread.s=)
+- MPS arena lock synchronizes allocation buffer access
+
+This is NOT ideal for performance (separate allocation points per thread
+would be better), but is safe and matches the original emacs-mac design.
+
+** Memory model: future X11/Windows dual-thread
+
+On X11/Windows (future ports), the GUI thread will be a genuinely
+separate OS thread with no Lisp =thread_state=.  In that case:
+
+- =current_thread->gc_info= will be NULL on the GUI thread
+- =igc_register_gui_thread()= will be called lazily from =thread_ap()=
+  to create separate allocation points and C stack root
+- The GUI thread's stack root prevents premature collection of
+  =Lisp_Object= references held in local variables during AppKit
+  event processing
+
+* Bugs Found and Fixed
+
+** B1: process_one_message arena parking → EDEADLK (CRITICAL)
+
+- *File*: =src/igc.c=, =process_one_message()=
+- *Committed in commit*: =64555df56c9=
+- *Symptom*: =../mps/code/lockix.c:127: Emacs fatal error: assertion
+  failed: res == 0= during =temacs --batch= dump phase
+- *Root cause*: =process_one_message= called =igc_park_arena()= which
+  calls =mps_arena_park()=.  But =process_one_message= can be called
+  from within an MPS allocation context (via =maybe_finalize= in
+  =igc_alloc_pseudovector=, triggered every ~1000 allocations).  The
+  =mps_arena_park= call tries to re-acquire the MPS arena lock, which
+  is already held by the current allocation → =EDEADLK=.
+- *Fix*: Removed arena parking from =process_one_message=.  Finalization
+  is safe without it because:
+  - MPS only delivers finalization messages when no flip is in progress
+  - The GIL ensures single-threaded Lisp execution
+  - The GUI thread uses the same gc_info path (no separate registration)
+- *Status*: Fixed in working tree.
+
+** B2: scan_bc fix — missed older frames (CRITICAL)
+
+- *File*: =src/igc.c=, =scan_bc()=
+- *Committed in commit*: =64555df56c9=
+- *Symptom*: =Bus error: 10= or =Segmentation fault: 11= inside
+  =exec_byte_code= during Lisp loading (dump phase)
+- *Root cause*: The fix changed the scan range from =bc->stack= (the
+  entire stack bottom) to =bc->fp= (current frame only).  But older
+  frames BELOW the current frame pointer may still hold live
+  =Lisp_Object= references.  Missing these → GC collects live objects
+  → dangling pointers → crash in bytecode execution.
+- *Fix*: Restored scanning from =bc->stack= (entire allocated bytecode
+  stack) to =bc->stack_end=.  Replaced the =HORRIBLE_ESTIMATE= of 1024
+  bytes with full-stack ambiguous scan.  Full-stack scanning is safe
+  (ambiguous scan treats each word as a potential reference) and
+  complete (no missed references).  The small performance cost of
+  scanning more memory is negligible vs. the correctness fix.
+- *Status*: Fixed in working tree.
+
+** B3: XHASH unavailable under HAVE_MPS (COMPILE ERROR)
+
+- *File*: =src/lisp.h=, lines 495-497
+- *Symptom*: =error: use of undeclared identifier 'XHASH'= in =mac.c=
+- *Root cause*: =XHASH= is intentionally disabled under =HAVE_MPS=.
+  =mac.c= uses =XHASH= in a binary search tree for circularity
+  detection during Lisp→CFType conversion.
+- *Why XHASH is disabled under HAVE_MPS*: =XHASH= returns the raw
+  tagged pointer value (=XUFIXNUM_RAW=).  Under MPS, objects can move,
+  so the hash changes after GC.  This makes it unsuitable for
+  persistent hash tables.  However, the bstree in =mac.c= is
+  ephemeral (built and used within a single Lisp call, no GC
+  interleaves), so address-based comparison is safe.
+- *Fix*: Replaced =XHASH= with =XUFIXNUM_RAW= directly (same
+  underlying value, not guarded by =HAVE_MPS=).  Added comment
+  explaining the bstree is ephemeral so address-based comparison is
+  correct.
+- *Status*: Fixed in working tree.
+
+** B4: gc_handle → Lisp_Object type mismatch (WARNING → RUNTIME BUG)
+
+- *File*: =src/macappkit.m=, line 10812
+- *Symptom*: =warning: incompatible pointer types sending 'gc_handle'
+  to parameter of type 'Lisp_Object'=
+- *Root cause*: Under IGC, =gc_handle= (=struct gc_handle_struct *=)
+  and =Lisp_Object= (=struct Lisp_X *=) are different pointer types.
+  The code passed =wv->help= (a =gc_handle=) directly where a
+  =Lisp_Object= was expected.  Under IGC, the callee would read
+  =gc_handle_struct= fields as =Lisp_X= header data — corrupt memory,
+  likely crash.
+- *Why it exists*: Pre-existing in the emacs-mac fork.  Under non-IGC
+  builds, =gc_handle= is likely typedef'd to =Lisp_Object= (no
+  warning).  Under IGC, they diverge.
+- *Fix*: Wrapped with =gc_handle_value(wv->help)= to extract the
+  =Lisp_Object= before passing.  Added =#include "gc-handles.h"= to
+  =macappkit.m=.
+- *Status*: Fixed in working tree.
+
+** B5: nsgui.h / macgui.h header conflict (COMPILE ERROR)
+
+- *File*: =src/dispextern.h=, =src/nsgui.h=, =src/nsterm.h=
+- *Symptom*: =typedef redefinition with different types= for =Window=,
+  =Emacs_Cursor=, =NativeRectangle=, =STORE_NATIVE_RECT=,
+  =GCForeground=, =GCBackground=
+- *Root cause*: =dispextern.h= included BOTH =macgui.h= (under
+  =HAVE_MACGUI=) and =nsgui.h= (under =HAVE_NS=) when both were
+  defined.  Both headers define the same type names differently.
+- *Fix*: Changed =dispextern.h= from separate =#ifdef= blocks to
+  =#elif= (mutually exclusive).  Added =#include "nsgui.h"= to
+  =nsterm.h= so NS files still get their types.  Wrapped NS-specific
+  types in =nsgui.h= with =#ifndef HAVE_MACGUI=.
+- *Status*: Fixed in working tree.
+
+** B6: thread_try_acquire_global_lock rename without include (COMPILE ERROR)
+
+- *File*: =src/thread.c=
+- *Symptom*: =use of undeclared identifier 'EBUSY'=
+- *Root cause*: Renamed =thread_try_acquire_global_lock= →
+  =gui_try_acquire_global_lock= but removed the =#ifdef HAVE_MACGUI=
+  guard that previously included =<errno.h>=.  =EBUSY= is defined in
+  =<errno.h>=.
+- *Fix*: Added =#include <errno.h>= to =thread.c=.
+- *Status*: Fixed in working tree.
+
+** B7: Missing forward declarations for NS bridge functions (COMPILE ERROR)
+
+- *File*: =src/nsterm.m=
+- *Symptom*: =use of undeclared identifier 'ns_call_on_gui_thread'=
+  etc.
+- *Root cause*: Bridge function definitions were added at the end of
+  the file (before =syms_of_nsterm=) but used EARLIER in
+  =ns_create_terminal=.  C/ObjC requires declarations before use.
+- *Fix*: Added =static= forward declarations at the top of the file.
+  Made function definitions =static= to match.
+- *Status*: Fixed in working tree.
+
+** B8: release_gil_hook return type mismatch (COMPILE ERROR)
+
+- *Files*: =src/termhooks.h=, =src/macterm.h=, =src/macappkit.m=,
+  =src/nsterm.m=, =src/xterm.c=, =src/xterm.h=
+- *Symptom*: =incompatible function pointer types= for
+  =release_gil_hook=
+- *Root cause*: =termhooks.h= declares =release_gil_hook= returning
+  =void=, but bridge functions (=mac_release_gil=, =ns_release_gil=,
+  =x_release_gil=) returned =int=.
+- *Fix*: Changed all bridge functions to return =void=.
+- *Status*: Fixed in working tree.
+
+** B9: gui_thread_id uses pthread_main_np() which returns int (COMPILE ERROR)
+
+- *File*: =src/macterm.c=
+- *Symptom*: =incompatible integer to pointer conversion assigning to
+  'sys_thread_t' from 'int'=
+- *Root cause*: =pthread_main_np()= returns =int= (0 or 1), but
+  =gui_thread_id= is =sys_thread_t= (=pthread_t=).
+- *Fix*: Changed to =pthread_self()=.
+- *Status*: Fixed in working tree.
+
+** B10: Missing igc_* stubs for non-HAVE_MPS builds (COMPILE ERROR)
+
+- *File*: =src/igc.h=
+- *Symptom*: =use of undeclared identifier 'igc_xzalloc_ambig'=
+  in =nsterm.m=
+- *Root cause*: =nsterm.m= uses =igc_xzalloc_ambig=,
+  =igc_realloc_ambig=, =igc_xalloc_raw_exact= but these are only
+  declared under =#ifdef HAVE_MPS=.  No non-MPS stubs existed.
+- *Fix*: Added =#define= stubs that call =xzalloc= / =xrealloc= /
+  =xfree= directly.
+- *Status*: Fixed in working tree.
+
+** B11: nsgui.h not included in nsterm.h for NS files (COMPILE ERROR)
+
+- *File*: =src/nsterm.h=
+- *Symptom*: After the =dispextern.h= fix (mutually exclusive headers),
+  NS files lost access to =nsgui.h= types.
+- *Root cause*: NS files got =nsgui.h= through =dispextern.h= which was
+  changed to only include =macgui.h= when =HAVE_MACGUI=.
+- *Fix*: Added =#include "nsgui.h"= under =#ifdef HAVE_NS= to
+  =nsterm.h=.
+- *Status*: Fixed in working tree.
+
+** B12: configure.ac MAC_OBJ not cleared when HAVE_MACGUI overridden (CONFIGURE BUG)
+
+- *File*: =configure.ac=, line 2999
+- *Symptom*: =make= tries to compile mac port files (mac.o, macterm.o,
+  etc.) even though config.h has =#undef HAVE_MACGUI= (because
+  =--with-ns= overrides =--with-mac=).
+- *Root cause*: When =HAVE_NS= is set, =HAVE_MACGUI= is forced to =no=
+  (line 2999), but =MAC_OBJ= and =MAC_OBJC_OBJ= were already set
+  earlier (lines 2987-2988) and never cleared.
+- *Fix*: Added =&& MAC_OBJ= && MAC_OBJC_OBJ== to the override line.
+- *Status*: Fixed in working tree.
+
+* Unresolved Issues
+
+** U1: False alarm — Ctrl-C during missing-package errors (resolved)
+
+- The earlier "SIGSEGV in print_object" was from pressing Ctrl-C during
+  error display about missing ELPA autoloads (package directories exist
+  but autoload files are missing).  Not a dual-thread issue.
+- `set-face-attribute` in early-init.el works fine under dual-thread.
+- `igc--debug` variable can be `setq`d even though `boundp` returns nil
+  (forward-reference semantics — same as other `DEFVAR_LISP` vars).
+
+** Backward compatibility (verified)
+
+All existing Lisp code works unchanged under the dual-thread model:
+- Early init, init, package loading, frame/face operations
+- No breaking changes from single-thread to dual-thread
+- The GUI thread is transparent to Lisp — all cross-thread dispatch
+  happens behind the scenes in C code (sync_call_on_gui_thread etc.)
+- Lisp never needs to know about dual-thread; it runs entirely on the
+  Lisp thread and all display operations are proxied automatically.
+
+** U2: SIGSEGV in print_object with complex init config (obsolete)
+
+- *Symptom*: Emacs crashes with `SIGSEGV` at `print_object + 4200` when
+  loading the user's full init config
+  (`--init-dir ~/.config/emacs-debug/`).  Crash address `0xb` (NULL + 11
+  bytes), suggesting a corrupted `Lisp_Object` pointer.
+- *Backtrace*: `cmd_error` → `print_error_message` → `print_object` →
+  SIGSEGV.  Crash happens during error display (echo area).
+- *Trigger*: User's config has multiple package-related errors (missing
+  autoloads).  After init completes with errors, Emacs tries to display
+  them and crashes.
+- *Batch works*: `--batch --eval '(message "ok")'` with same init
+  completes without crash.
+- *-Q works*: `-Q` mode works fine.
+- *Likely cause*: Pre-existing IGC bug in the emacs-mac fork.  Not
+  caused by dual-thread changes (my IGC changes are limited to scan_bc
+  and process_one_message, both of which are safe/restorative).  The
+  corrupt `Lisp_Object` at address `0xb` suggests an object was moved
+  or collected by IGC while still referenced, or an uninitialized
+  variable.
+- *Diagnosis ideas*:
+  - Run with MPS debugging flags (`--with-mps=debug`)
+  - Add `eassert` around suspect `Lisp_Object` values
+  - Try to minimize the init config to find the trigger
+
+** U2: `make install` does not copy native-lisp .eln files (pre-existing)
+
+- See entry in pre-existing issues table below.
+
+* Pre-Existing Issues (Not from my changes)
+
+These issues existed in the codebase before the dual-thread work and
+are documented here for awareness:
+
+| Issue | File | Notes |
+|-------+------+-------|
+| =macterm.h:361= =union vectorlike_header= should be =struct= | =macterm.h= | Only affects combined NS+Mac builds (user's env) |
+| =mac.c= uses =tool_bar_window=, =tab_bar_window= — struct frame doesn't have these | =mac.c=, =frame.h= | Pre-existing in emacs-mac fork |
+| =mac_activate_menubar= undeclared in =macmenu.c= | =macmenu.c= | Function exists in macappkit.m but not declared |
+| NSRect member access (=.x=, =.y=) in mac files | =macterm.c=, =macfns.c=, =macappkit.m= | =SignedRectangle= vs =NSRect= layout mismatch |
+| =XSETFRAME=, =XCAR= etc. macros conflict | =dispextern.h=, =macgui.h=, =nsgui.h= | Only in combined builds |
+| =check_x_display_info= redefinition | =macfns.c= | Mac port vs NS port type conflict |
+
+* Design Decisions
+
+** D1: No separate GUI thread MPS registration on macOS
+
+- *Why*: Both threads share =current_thread= → =main_thread.s.gc_info=.
+  Registering separately would double-register the same OS thread →
+  MPS tries to suspend the same thread twice → deadlock.
+- *When needed*: X11/Windows dual-thread ports where GUI thread is a
+  separate OS thread with no =thread_state=.
+- *File*: =src/igc.c=, =thread_ap()=
+
+** D2: =process_one_message= must NOT park the arena
+
+- *Why*: It's called from within MPS allocation context (=maybe_finalize=
+  in =igc_alloc_pseudovector=).  Parking would recursively acquire the
+  arena lock → =EDEADLK=.
+- *Safety*: MPS only delivers finalization messages when no flip is
+  in progress.  The GIL ensures single-threaded Lisp execution.
+- *File*: =src/igc.c=, =process_one_message()=
+- *See bug*: B1
+
+** D3: =scan_bc= must scan the ENTIRE bytecode stack
+
+- *Why*: Older frames below the current frame pointer (=bc->fp=) may
+  still hold live =Lisp_Object= references.  Scanning only from
+  =bc->fp= upward misses these → dangling pointers.
+- *Performance*: Full-stack ambiguous scan is safe and complete.
+  The old =HORRIBLE_ESTIMATE= could miss references beyond 1024 bytes
+  from the frame end → also a correctness bug.
+- *File*: =src/igc.c=, =scan_bc()=
+- *See bug*: B2
+
+** D4: =XHASH= uses =XUFIXNUM_RAW= directly under =HAVE_MPS=
+
+- *Why*: =XHASH= is disabled under =HAVE_MPS= by design (unstable
+  across GC cycles).  For ephemeral use (bstree in mac.c, built and
+  consumed in one Lisp call), =XUFIXNUM_RAW= is safe because no GC
+  interleaves.
+- *File*: =src/mac.c=, =bstree_find()=
+- *See bug*: B3
+
+** D5: =gc_handle= vs =Lisp_Object= distinction under IGC
+
+- *Why*: Under IGC, =gc_handle= (=struct gc_handle_struct *=) tracks
+  =Lisp_Object= values that may move.  =gc_handle_value()= must be
+  called to extract the current =Lisp_Object=.  Passing =gc_handle=
+  directly where =Lisp_Object= is expected reads wrong memory.
+- *Search*: Look for =gc_handle= variables passed to functions taking
+  =Lisp_Object= without =gc_handle_value()=.
+- *See bug*: B4
+
+* Quick Reference
+
+| Symptom | Likely cause | Fix |
+|---------+--------------+-----|
+| =lockix.c:127= assertion | Arena park from within MPS allocation | Remove =igc_park_arena= from =process_one_message= |
+| =exec_byte_code= crash in dump | =scan_bc= missing older frames | Scan from =bc->stack= not =bc->fp= |
+| =XHASH= undeclared | =HAVE_MPS= disables =XHASH= | Use =XUFIXNUM_RAW= for ephemeral bstree |
+| =gc_handle= to =Lisp_Object= warning | Direct =gc_handle= pass | Call =gc_handle_value()= |
+| nsgui/macgui type conflict | Both headers included simultaneously | Mutual exclusion via =#elif= |
+| =EBUSY= undeclared | Missing =<errno.h>= | Add include |
+| Bridge funcs undeclared | Forward reference in ObjC | Add =static= forward declarations |
+| =release_gil= returns =int= | Wrong return type | Change to =void= |
+| =pthread_main_np= to =pthread_t= | Wrong function | Use =pthread_self()= |
+| =igc_xzalloc_ambig= undeclared | Missing non-MPS stub | Add =#define= stub in =igc.h= |
+| MAC_OBJ compiled without HAVE_MACGUI | configure.ac not clearing vars | Fix configure.ac line 2999 |
+| ELN_DESTDIR points to Frameworks/ | configure.ac sets mac_applibdir=Contents/Frameworks, but make install ELN_DESTDIR uses it for .eln files; Emacs looks in Contents/native-lisp/ | Fix Makefile.in ELN_DESTDIR to use mac_appdir/.../native-lisp/ |

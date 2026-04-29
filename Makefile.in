@@ -374,7 +374,7 @@ ELN_DESTDIR = ${ns_applibdir}/
 endif
 else
 BIN_DESTDIR='${mac_appbindir}/'
-ELN_DESTDIR = ${mac_applibdir}/
+ELN_DESTDIR = ${mac_appdir}/Emacs.app/Contents/native-lisp/
 endif
 
 gsettings_SCHEMAS = etc/org.gnu.emacs.defaults.gschema.xml

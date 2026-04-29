@@ -1514,6 +1514,8 @@ fix_symbol (mps_ss_t ss, struct Lisp_Symbol *sym)
 }
 
 static mps_res_t dflt_scan_obj (mps_ss_t ss, mps_addr_t start);
+static mps_ap_t thread_ap_for_type (enum igc_obj_type type,
+				    struct igc_thread *t);
 
 static mps_res_t
 scan_lispsym (mps_ss_t ss, void *start, void *end, void *closure)
@@ -1786,21 +1788,29 @@ scan_bc (mps_ss_t ss, void *start, void *end, void *closure)
     struct bc_thread_state *bc = closure;
     igc_assert (start == (void *) bc->stack);
     igc_assert (end == (void *) bc->stack_end);
-    /* FIXME/igc: AFAIU the current top frame starts at
-       bc->fp->next_stack and has a maximum length that is given by the
-       bytecode being executed (COMPILED_STACK_DEPTH).  So, we need to
-       scan upto bc->fo->next_stack + that max depth to be safe.  Since
-       I don't have that number ATM, I'm using an arbitrary estimate for
-       now.
 
-       This must be changed to something better.  Note that Mattias said
-       the bc stack marking will be changed in the future.  */
-    const size_t HORRIBLE_ESTIMATE = 1024;
-    char *scan_end = bc_next_frame (bc->fp);
-    scan_end += HORRIBLE_ESTIMATE;
-    end = min (end, (void *) scan_end);
-    if (end > start)
-      IGC_FIX_CALL (ss, scan_ambig (ss, start, end, NULL));
+    /* Scan the ENTIRE allocated bytecode stack, from bottom (bc->stack)
+       to top (bc->stack_end).  This replaces the old HORRIBLE_ESTIMATE
+       (1024 bytes past bc_next_frame(fp)) which could miss valid
+       references in deep bytecode frames or frames above the current
+       one.
+
+       Scanning from bc->stack (not bc->fp) is essential: older frames
+       below the current frame pointer may still hold Lisp_Object
+       references that must not be collected.
+
+       This is an ambiguous scan, so every word-sized value is treated
+       as a potential tagged Lisp_Object reference.  It is safe and
+       complete, though it may conservatively pin some objects.
+
+       Per bc_thread_state:
+         bc->fp       current frame pointer (NULL if no active bytecode)
+         bc->stack    start of allocated bytecode stack
+         bc->stack_end  end of allocated bytecode stack  */
+    char *scan_start = (char *) start;   /* always bc->stack */
+    char *scan_end = (char *) end;       /* always bc->stack_end */
+    if (scan_end > scan_start)
+      IGC_FIX_CALL (ss, scan_ambig (ss, scan_start, scan_end, NULL));
   }
   MPS_SCAN_END (ss);
   return MPS_RES_OK;
@@ -3984,7 +3994,153 @@ w32_remove_non_lisp_thread (void *info)
   xfree (t);
 }
 
+#endif /* HAVE_NTGUI */
+
+/***********************************************************************
+		GUI thread MPS registration
+
+   Registers the GUI thread with MPS for the dual-thread UI model.
+
+   The GUI thread (initial main() thread in the emacs-mac port) runs
+   AppKit event processing.  It allocates GC-managed memory via the
+   standard Emacs allocation path (Fcons, build_string, make_float,
+   etc. in macappkit.m), so it needs its own MPS registration with
+   full allocation points and a stack root.
+
+   This is analogous to w32_add_non_lisp_thread() above, but with
+   allocation points added (the GUI thread DOES allocate, unlike the
+   Windows non-Lisp helper thread which only scanns its stack).
+
+   The registration is called lazily from thread_ap() on the first
+   allocation from the GUI thread.  By that point, global_igc and
+   the pools have been set up by init_igc() (which ran on the Lisp
+   thread during emacs_main).  If the IGC is not yet ready (state is
+   IGC_STATE_INITIAL), alloc_impl calls emacs_abort() anyway, so the
+   lazy registration is safe from any ordering concerns.
+
+   Deregistration (igc_deregister_gui_thread) is called during Emacs
+   shutdown to clean up MPS resources.  The GUI thread lives as long
+   as the process, so this is primarily for clean shutdown.  */
+
+/* Static storage for the GUI thread's MPS thread info.
+   Populated by igc_register_gui_thread(), read by thread_ap().
+   Non-NULL means the GUI thread is registered with MPS.
+
+   Set to GUI_THREAD_SINGLE_THREADED when in single-threaded mode
+   (temacs --batch), meaning mac_gui_thread_p() returns true but
+   there is no separate GUI thread — the main thread is the only
+   thread and is already registered via add_main_thread().
+
+   volatile: read/written from both GUI and Lisp threads.  The
+   write (in igc_register_gui_thread) and first read (in thread_ap)
+   are on the same thread (GUI).  The clear (in igc_deregister_gui_thread)
+   happens on the Lisp thread during shutdown, after the GUI thread has
+   stopped, so no true concurrent access occurs -- volatile prevents
+   the compiler from eliding the check.  */
+static struct igc_thread * volatile gui_gc_info;
+
+/* Sentinel value: gui_gc_info is set to this in single-threaded mode
+   to indicate "mac_gui_thread_p() is true but we are the only thread,
+   use the normal Lisp thread allocation path."  */
+#define GUI_THREAD_SINGLE_THREADED ((struct igc_thread *) 1)
+
+void
+igc_register_gui_thread (void)
+{
+  mps_thr_t thr;
+  mps_res_t res;
+
+  /* Only register once.  */
+  if (gui_gc_info)
+    return;
+
+  /* Must have a global IGC arena (set up by init_igc()).  */
+  eassert (global_igc != NULL);
+  eassert (igc_state != IGC_STATE_INITIAL);
+
+  /* Detect single-threaded mode: temacs --batch or any scenario where
+     the main thread is the ONLY thread (no separate GUI thread exists).
+     In this case, the main thread was already registered by
+     add_main_thread() during init.  Calling mps_thread_reg() again for
+     the same OS thread would double-register it, causing MPS to attempt
+     a double-suspend during flips — which deadlocks (assertion failure
+     at lockix.c:127).
+
+     The sentinel GUI_THREAD_SINGLE_THREADED tells thread_ap() to fall
+     through to the normal Lisp thread allocation path.  */
+  if (current_thread && current_thread->gc_info)
+    {
+      gui_gc_info = GUI_THREAD_SINGLE_THREADED;
+      return;
+    }
+
+  /* Register with MPS.  This tells MPS that this (the GUI) thread
+     exists and may allocate from the arena.  MPS will suspend this
+     thread during GC flips to scan its stack for references.  */
+  res = mps_thread_reg (&thr, global_igc->arena);
+  IGC_CHECK_RES (res);
+
+  /* Allocate and initialize the thread info struct.
+     ts = NULL because the GUI thread has no Lisp thread_state.  */
+  struct igc_thread *t = xzalloc (sizeof *t);
+  t->gc = global_igc;
+  t->thr = thr;
+  t->ts = NULL;
+
+  /* Create an ambiguous stack root for the GUI thread's C stack.
+     This is critical: the GUI thread holds Lisp_Object references
+     on its C stack between creation (Fcons etc.) and consumption
+     (kbd_buffer_store_event etc.).  Without this root, MPS could
+     collect or move those objects during a GC flip.  */
+  {
+    void *stack_marker;
+    mps_root_t root;
+    res = mps_root_create_thread_scanned (&root, global_igc->arena,
+                                          mps_rank_ambig (), 0, thr,
+                                          scan_ambig, 0, &stack_marker);
+    IGC_CHECK_RES (res);
+    t->stack_root = register_root (global_igc, root, &stack_marker,
+                                   NULL, true, "gui-thread-stack");
+  }
+
+  /* Create the full set of allocation points.
+     The GUI thread allocates all object types (cons, string data,
+     float, vectors, weak refs, etc.), so it needs the same APs
+     as any Lisp thread.  */
+  create_thread_aps (t);
+
+  gui_gc_info = t;
+}
+
+void
+igc_deregister_gui_thread (void)
+{
+  if (!gui_gc_info || gui_gc_info == GUI_THREAD_SINGLE_THREADED)
+    {
+      gui_gc_info = NULL;
+      return;
+    }
+
+  struct igc_thread *t = gui_gc_info;
+
+  mps_root_destroy (deregister_root (t->stack_root));
+  mps_ap_destroy (t->dflt_ap);
+  mps_ap_destroy (t->leaf_ap);
+  mps_ap_destroy (t->weak_strong_ap);
+  mps_ap_destroy (t->weak_weak_ap);
+#ifndef USE_EPHEMERON_POOL
+  mps_ap_destroy (t->weak_hash_strong_ap);
+  mps_ap_destroy (t->weak_hash_weak_ap);
 #endif
+#ifdef USE_EPHEMERON_POOL
+  mps_ap_destroy (t->ephemeron_ap);
+#endif
+  mps_ap_destroy (t->immovable_ap);
+  mps_thread_dereg (t->thr);
+  xfree (t);
+
+  gui_gc_info = NULL;
+}
 
 static void
 _release_arena (void)
@@ -4680,8 +4836,20 @@ process_one_message (struct igc *gc)
     {
       mps_addr_t addr;
       mps_message_finalization_ref (&addr, gc->arena, msg);
-      /* FIXME/igc: other threads should be suspended while finalizing
-	 objects.  */
+      /* Finalization during a GC flip or MPS allocation is safe:
+	 - MPS only delivers finalization messages when the collector
+	   is not actively scanning (no flip in progress).
+	 - The GIL ensures only one Lisp thread runs, so no other
+	   thread accesses the finalized objects concurrently.
+	 - The GUI thread is not registered with MPS on macOS (the
+	   current_thread->gc_info path covers both threads), so MPS
+	   never tries to suspend it during flips.
+
+	 We do NOT park the arena here because process_one_message
+	 may be called from within an MPS allocation context (via
+	 maybe_finalize in igc_alloc_pseudovector).  Parking would
+	 attempt to re-acquire the MPS arena lock, which is already
+	 held by the current allocation, causing EDEADLK.  */
       finalize (gc, addr);
     }
   else if (type == mps_message_type_gc_start ())
@@ -4888,7 +5056,44 @@ igc_on_idle (void)
 static mps_ap_t
 thread_ap (enum igc_obj_type type)
 {
+  /* Determine which thread info to use.
+
+     In the emacs-mac dual-thread model, both the GUI thread and the
+     Lisp thread share the same current_thread global (main_thread.s),
+     which has gc_info set by add_main_thread() during init.  This
+     means current_thread->gc_info is always non-NULL on both threads.
+
+     The GUI thread and Lisp thread share the main thread's allocation
+     points.  MPS internally synchronizes allocation buffer access via
+     the arena lock, so sharing is safe (though not optimal for
+     performance — each thread could have its own APs).
+
+     igc_register_gui_thread() is available for platforms where the
+     GUI thread is a genuinely separate OS thread with no Lisp
+     thread_state (future X11/Win32 dual-thread ports).  On macOS,
+     the current_thread->gc_info path covers all allocation.  */
+#if defined HAVE_MACGUI
+  if (mac_gui_thread_p ())
+    {
+      /* In the macOS dual-thread model, current_thread points to
+	 main_thread.s on BOTH threads.  gc_info is always set.
+	 Use it directly — no separate GUI registration needed.  */
+    }
+#endif
+
+  eassert (current_thread != NULL);
+  eassert (current_thread->gc_info != NULL);
+
   struct igc_thread_list *t = current_thread->gc_info;
+  return thread_ap_for_type (type, &t->d);
+}
+
+/* Helper: given an object TYPE and thread info T (with allocation
+   points created by create_thread_aps), return the correct allocation
+   point for that type.  Shared between GUI and Lisp threads.  */
+static mps_ap_t
+thread_ap_for_type (enum igc_obj_type type, struct igc_thread *t)
+{
   switch (type)
     {
     case IGC_OBJ_INVALID:
@@ -4905,25 +5110,25 @@ thread_ap (enum igc_obj_type type)
       emacs_abort ();
 
     case IGC_OBJ_MARKER_VECTOR:
-      return t->d.weak_weak_ap;
+      return t->weak_weak_ap;
 
 #ifndef USE_EPHEMERON_POOL
     case IGC_OBJ_WEAK_HASH_TABLE_WEAK_PART:
-      return t->d.weak_hash_weak_ap;
+      return t->weak_hash_weak_ap;
 
     case IGC_OBJ_WEAK_HASH_TABLE_STRONG_PART:
-      return t->d.weak_hash_strong_ap;
+      return t->weak_hash_strong_ap;
 #endif
 
 #ifdef USE_EPHEMERON_POOL
     case IGC_OBJ_PAIR_VECTOR:
-      return t->d.dflt_ap;
+      return t->dflt_ap;
 
     case IGC_OBJ_WEAK_KEY_PAIR_VECTOR:
     case IGC_OBJ_WEAK_VALUE_PAIR_VECTOR:
     case IGC_OBJ_WEAK_OR_PAIR_VECTOR:
     case IGC_OBJ_WEAK_AND_PAIR_VECTOR:
-      return t->d.ephemeron_ap;
+      return t->ephemeron_ap;
 #endif
 
     case IGC_OBJ_VECTOR:
@@ -4939,12 +5144,12 @@ thread_ap (enum igc_obj_type type)
     case IGC_OBJ_FACE_CACHE:
     case IGC_OBJ_BLV:
     case IGC_OBJ_HANDLER:
-      return t->d.dflt_ap;
+      return t->dflt_ap;
 
     case IGC_OBJ_STRING_DATA:
     case IGC_OBJ_FLOAT:
     case IGC_OBJ_BYTES:
-      return t->d.leaf_ap;
+      return t->leaf_ap;
     }
   emacs_abort ();
 }
@@ -5151,6 +5356,8 @@ alloc (size_t size, enum igc_obj_type type)
 static mps_addr_t
 alloc_immovable (size_t size, enum igc_obj_type type)
 {
+  /* Both GUI and Lisp threads share current_thread->gc_info
+     (main_thread.s) on macOS.  Use the standard path.  */
   struct igc_thread_list *t = current_thread->gc_info;
   return alloc_impl (size, type, t->d.immovable_ap);
 }
@@ -6716,6 +6923,11 @@ were the default value.  */);
   DEFVAR_BOOL ("igc--balance-intervals", igc__balance_intervals,
      doc: /* Whether to balance buffer intervals when idle.  */);
   igc__balance_intervals = false;
+
+  DEFVAR_LISP ("igc--debug", Vigc__debug,
+    doc: /* Enable IGC debug output (only effective when compiled with
+--enable-checking=igc_debug).  */);
+  Vigc__debug = Qnil;
 
   DEFVAR_LISP ("igc--dependency-replacements", Vigc__dependency_replacements,
      doc: /* Internal use only.  */);

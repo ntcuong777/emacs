@@ -2996,7 +2996,7 @@ ns_self_contained=no
 NS_OBJ=
 NS_OBJC_OBJ=
 if test "${HAVE_NS}" = yes; then
-  test "${window_system}" = mac && HAVE_MACGUI=no
+  test "${window_system}" = mac && HAVE_MACGUI=no && MAC_OBJ= && MAC_OBJC_OBJ=
   if test "$with_toolkit_scroll_bars" = "no"; then
     AC_MSG_WARN([Non-toolkit scroll bars are not implemented for Nextstep.])
   fi

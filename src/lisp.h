@@ -1341,7 +1341,7 @@ INLINE EMACS_INT
 {
   return lisp_h_XHASH (a);
 }
-#endif
+#endif /* HAVE_MPS */
 
 /* Like make_fixnum (N), but may be faster.  N must be in nonnegative range.  */
 INLINE Lisp_Object
@@ -6029,6 +6029,13 @@ extern void syms_of_xterm (void);
 extern char *get_keysym_name (int);
 #endif /* HAVE_WINDOW_SYSTEM */
 
+/* Dual-thread UI support.  */
+#include "sync.h"
+#include "event-loop.h"
+
+/* Defined in emacs.c */
+extern int emacs_main (int, char **);
+
 #ifdef HAVE_MACGUI
 /* Defined in macfns.c */
 extern void syms_of_macfns (void);
@@ -6059,13 +6066,10 @@ extern void *mac_alloc_autorelease_pool (void);
 extern void mac_release_autorelease_pool (void *);
 #endif
 
-/* Defined in macappkit.m */
+/* Defined in macappkit.m (legacy) */
 extern bool mac_gui_thread_p (void);
 extern void mac_handle_alarm_signal (void);
 extern void mac_within_lisp_deferred_if_gui_thread (void (^) (void));
-
-/* Defined in emacs.c */
-extern int emacs_main (int, char **);
 #endif /* HAVE_MACGUI */
 
 /* Defined in xml.c.  */

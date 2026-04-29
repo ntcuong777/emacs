@@ -20,6 +20,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 
 
 #include "dispextern.h"
+#ifdef HAVE_NS
+#include "nsgui.h"
+#endif
 #include "frame.h"
 #include "character.h"
 #include "font.h"

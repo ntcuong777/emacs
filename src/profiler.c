@@ -349,7 +349,15 @@ static void
 add_sample (struct profiler_log *plog, EMACS_INT count)
 {
 #ifdef HAVE_MPS
-  if (igc_busy_p ())
+  /* On macOS dual-thread mode, the SIGPROF signal is delivered to the
+     GUI thread (main thread).  igc_busy_p() calls mps_arena_busy()
+     which acquires the MPS arena lock -- unsafe from a signal handler
+     on the GUI thread (could deadlock if MPS is flipping).  */
+  bool skip_gc_check = false;
+#if defined HAVE_MACGUI
+  skip_gc_check = mac_gui_thread_p ();
+#endif
+  if (!skip_gc_check && igc_busy_p ())
 #else
   if (BASE_EQ (backtrace_top_function (), QAutomatic_GC)) /* bug#60237 */
 #endif

@@ -142,14 +142,17 @@ typedef XImage *Emacs_Pix_Container;
 typedef HDC Emacs_Pix_Context;
 #endif
 
-#ifdef HAVE_MACGUI
+/* The mac port (HAVE_MACGUI) is the primary macOS GUI backend.
+   When both HAVE_MACGUI and HAVE_NS are defined (occurs when building
+   both mac and NS ports on macOS), only macgui.h is included here to
+   avoid type conflicts.  The NS files include nsgui.h through nsterm.h
+   when HAVE_NS is defined.  */
+#if defined HAVE_MACGUI
 #include "macgui.h"
 typedef struct mac_display_info Display_Info;
 typedef XGCValues Emacs_GC;
 typedef SignedRectangle Emacs_Rectangle;
-#endif
-
-#ifdef HAVE_NS
+#elif defined HAVE_NS
 #include "nsgui.h"
 /* Following typedef needed to accommodate the MSDOS port, believe it or not.  */
 typedef struct ns_display_info Display_Info;

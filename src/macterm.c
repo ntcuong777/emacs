@@ -26,6 +26,8 @@ along with GNU Emacs Mac port.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "sysstdio.h"
 
 #include "macterm.h"
+#include "sync.h"
+#include "event-loop.h"
 
 #include "systime.h"
 
@@ -5625,6 +5627,10 @@ mac_term_init (Lisp_Object display_name, char *xrm_option, char *resource_name)
   memset (dpyinfo, 0, sizeof (*dpyinfo));
   terminal = mac_create_terminal (dpyinfo);
 
+  /* Initialize dual-thread UI sync and event-loop state.  */
+  sync_init_terminal (terminal);
+  event_loop_init (terminal);
+
   terminal->kboard = allocate_kboard (Qmac);
   /* Don't let the initial kboard remain current longer than necessary.
      That would cause problems if a file loaded on startup tries to
@@ -5844,6 +5850,17 @@ mac_create_terminal (struct mac_display_info *dpyinfo)
   terminal->free_pixmap = image_free_pix_container;
   terminal->delete_frame_hook = mac_destroy_window;
   terminal->delete_terminal_hook = mac_delete_terminal;
+
+  /* Dual-thread UI hooks.  */
+  terminal->dual_thread_p = true;
+  terminal->gui_thread_id = pthread_self ();
+  terminal->call_on_gui_thread = mac_call_on_gui_thread;
+  terminal->defer_to_gui_thread = mac_defer_to_gui_thread;
+  terminal->call_on_lisp_thread = mac_call_on_lisp_thread;
+  terminal->threaded_select_hook = mac_threaded_select;
+  terminal->try_acquire_gil_hook = mac_try_acquire_gil;
+  terminal->release_gil_hook = mac_release_gil;
+
   /* Other hooks are NULL by default.  */
 
   return terminal;

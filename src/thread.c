@@ -19,6 +19,7 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 
 #include <config.h>
 #include <setjmp.h>
+#include <errno.h>
 #include "lisp.h"
 #include "igc.h"
 #include "character.h"
@@ -1264,10 +1265,12 @@ thread_all_before_buffer_killed (Lisp_Object current)
     }
 }
 
-#ifdef HAVE_MACGUI
-#include <errno.h>
+/* Try to acquire the global lock without blocking.
+   Returns 0 on success, EBUSY if the lock is held by another thread.
+   Used by the GUI thread to access buffer/glyph-matrix data when
+   other Lisp threads may be running.  */
 int
-thread_try_acquire_global_lock (void)
+gui_try_acquire_global_lock (void)
 {
   /* Sometimes we try to acquire the lock after a lisp thread has
      completed, but before another lisp thread (like the main lisp
@@ -1280,12 +1283,13 @@ thread_try_acquire_global_lock (void)
   return pthread_mutex_trylock (&global_lock);
 }
 
+/* Release the global lock previously acquired via
+   gui_try_acquire_global_lock.  */
 int
-thread_release_global_lock (void)
+gui_release_global_lock (void)
 {
   return pthread_mutex_unlock (&global_lock);
 }
-#endif
 
 
 

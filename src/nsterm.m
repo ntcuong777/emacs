@@ -44,6 +44,9 @@ GNUstep port and post-20 update by Adrian Robert (arobert@cogsci.ucsd.edu)
 
 #include "lisp.h"
 #include "igc.h"
+#include "thread.h"
+#include "sync.h"
+
 #include "blockinput.h"
 #include "sysselect.h"
 #include "nsterm.h"
@@ -474,6 +477,19 @@ ev_modifiers_helper (unsigned int flags, unsigned int left_mask,
 /* TODO: Get rid of need for these forward declarations.  */
 static void ns_condemn_scroll_bars (struct frame *f);
 static void ns_judge_scroll_bars (struct frame *f);
+
+/* Dual-thread UI bridge function forward declarations.  */
+static void ns_call_on_gui_thread (struct terminal *,
+				   void (*fn) (void *), void *data);
+static void ns_defer_to_gui_thread (struct terminal *,
+				    void (*fn) (void *), void *data);
+static void ns_call_on_lisp_thread (struct terminal *,
+				    void (*fn) (void *), void *data);
+static int ns_threaded_select (struct terminal *,
+			       int, fd_set *, fd_set *, fd_set *,
+			       struct timespec *, sigset_t *);
+static int ns_try_acquire_gil (struct terminal *);
+static void ns_release_gil (struct terminal *);
 
 
 /* ==========================================================================
@@ -5930,6 +5946,20 @@ ns_create_terminal (struct ns_display_info *dpyinfo)
   terminal->delete_frame_hook = ns_destroy_window;
   terminal->delete_terminal_hook = ns_delete_terminal;
   terminal->change_tab_bar_height_hook = ns_change_tab_bar_height;
+
+  /* Dual-thread UI hooks.  Single-threaded mode by default;
+     the emacs-mac port provides the full dual-thread implementation
+     in macappkit.m.  These hooks are set so cross-platform code
+     can use terminal->call_on_gui_thread etc. regardless of platform.  */
+  terminal->dual_thread_p = false;
+  terminal->gui_thread_id = 0;
+  terminal->call_on_gui_thread = ns_call_on_gui_thread;
+  terminal->defer_to_gui_thread = ns_defer_to_gui_thread;
+  terminal->call_on_lisp_thread = ns_call_on_lisp_thread;
+  terminal->threaded_select_hook = ns_threaded_select;
+  terminal->try_acquire_gil_hook = ns_try_acquire_gil;
+  terminal->release_gil_hook = ns_release_gil;
+
   /* Other hooks are NULL by default.  */
 
   return terminal;
@@ -11529,6 +11559,63 @@ mark_nsterm (void)
 	    }
 	}
     }
+}
+
+
+/***********************************************************************
+		   NS Dual-thread UI bridge functions
+
+   These bridge between the NS port's Cocoa/GNUstep event loop and the
+   generic cross-thread dispatch layer (sync.h / event-loop.h).
+
+   In single-threaded mode (dual_thread_p == false, the default for
+   the NS port), these functions execute directly on the calling
+   thread.
+
+   The emacs-mac port (macappkit.m) provides the full dual-thread
+   implementation for macOS/Cocoa.  The NS port is primarily for
+   GNUstep compatibility.
+***********************************************************************/
+
+static void
+ns_call_on_gui_thread (struct terminal *terminal,
+		       void (*fn) (void *), void *data)
+{
+  fn (data);
+}
+
+static void
+ns_defer_to_gui_thread (struct terminal *terminal,
+			void (*fn) (void *), void *data)
+{
+  fn (data);
+}
+
+static void
+ns_call_on_lisp_thread (struct terminal *terminal,
+			void (*fn) (void *), void *data)
+{
+  fn (data);
+}
+
+static int
+ns_threaded_select (struct terminal *terminal,
+		    int nfds, fd_set *rfds, fd_set *wfds, fd_set *efds,
+		    struct timespec *timeout, sigset_t *sigmask)
+{
+  return thread_select (pselect, nfds, rfds, wfds, efds, timeout, sigmask);
+}
+
+static int
+ns_try_acquire_gil (struct terminal *terminal)
+{
+  return gui_try_acquire_global_lock ();
+}
+
+static void
+ns_release_gil (struct terminal *terminal)
+{
+  gui_release_global_lock ();
 }
 
 void

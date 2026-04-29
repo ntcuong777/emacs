@@ -1,0 +1,305 @@
+#+TITLE: IGC + Dual-Thread UI Model Integration
+#+DATE: 2026-04-29
+#+AUTHOR: Emacs Development
+
+* Overview
+
+This document describes the integration between the MPS incremental
+garbage collector (IGC) and the dual-thread UI model.
+
+The dual-thread model splits Emacs into two threads:
+- *GUI thread*: the initial =main()= thread, runs native GUI event
+  loop (AppKit/Cocoa, or in the future X11/Windows)
+- *Lisp thread*: created via =pthread_create=, runs =emacs_main()=
+  with Lisp evaluation and redisplay
+
+Both threads allocate GC-managed memory and must be properly registered
+with MPS.
+
+* Thread Registration
+
+** Lisp thread registration
+
+The Lisp thread is registered during Emacs startup:
+
+#+BEGIN_SRC c
+// igc.c:6715, called from init_igc() on the Lisp thread
+add_main_thread ();
+  → thread_add (current_thread)
+    → mps_thread_reg (&thr, global_igc->arena)   // register with MPS
+    → register_thread (global_igc, thr, ts)       // push to global list
+    → root_create_thread (t)                      // ambiguous stack root
+    → create_thread_aps (&t->d)                   // allocation points
+  → current_thread->gc_info = t                   // store in thread_state
+
+// Lisp workers created via make-thread:
+self->gc_info = igc_thread_add (self);
+  → thread_add (self)         // same pipeline
+  → root_create_specpdl (t)   // exact root for specpdl
+  → root_create_bc (t)        // ambiguous root for bytecode stack
+#+END_SRC
+
+** GUI thread registration (NEW)
+
+The GUI thread is registered =lazily= on its first allocation:
+
+#+BEGIN_SRC c
+// igc.c:5016-5034, called from thread_ap()
+if (mac_gui_thread_p ())
+  {
+    if (!gui_gc_info)
+      igc_register_gui_thread ();
+
+    return thread_ap_for_type (type, gui_gc_info);
+  }
+#+END_SRC
+
+The registration function (=igc_register_gui_thread=, igc.c:4031):
+
+#+BEGIN_SRC c
+igc_register_gui_thread (void)
+  → mps_thread_reg (&thr, global_igc->arena)    // register with MPS
+  → mps_root_create_thread_scanned (...)          // ambiguous C stack root
+  → create_thread_aps (t)                        // full allocation points
+  → gui_gc_info = t                              // store in static variable
+#+END_SRC
+
+Key differences from Lisp thread registration:
+
+| Aspect | Lisp thread | GUI thread |
+|--------+-------------+------------|
+| =thread_state= needed | Yes (=ts ≠ NULL=) | No (=ts = NULL=) |
+| Specpdl root | Yes | No (no specpdl) |
+| Bytecode root | Yes | No (no bytecode) |
+| Stack root | Yes | Yes (via =mps_root_create_thread_scanned=) |
+| Allocation points | Full set (7-8 APs) | Full set (same) |
+
+* Allocation Paths
+
+** Standard allocation (=alloc=)
+
+All GC-managed allocation goes through =alloc()= → =alloc_impl()= →
+=thread_ap()=.
+
+=thread_ap()= dispatches based on which thread calls it:
+
+#+BEGIN_SRC c
+thread_ap (enum igc_obj_type type)
+{
+#if defined HAVE_MACGUI
+  if (mac_gui_thread_p ())
+    {
+      if (!gui_gc_info)
+        igc_register_gui_thread ();   // lazy registration
+      return thread_ap_for_type (type, gui_gc_info);
+    }
+#endif
+  return thread_ap_for_type (type, &current_thread->gc_info->d);
+}
+#+END_SRC
+
+The helper =thread_ap_for_type= maps object types to allocation points:
+
+| Object types | Allocation point |
+|-------------+------------------|
+| =IGC_OBJ_CONS=, =IGC_OBJ_VECTOR=, =IGC_OBJ_SYMBOL=, =IGC_OBJ_STRING=, =IGC_OBJ_INTERVAL=, =IGC_OBJ_IMAGE=, =IGC_OBJ_FACE=, =IGC_OBJ_BLV=, =IGC_OBJ_HANDLER= | =dflt_ap= |
+| =IGC_OBJ_STRING_DATA=, =IGC_OBJ_FLOAT=, =IGC_OBJ_BYTES= | =leaf_ap= |
+| =IGC_OBJ_MARKER_VECTOR= | =weak_weak_ap= |
+| Weak hash table parts | =weak_hash_weak_ap= / =weak_hash_strong_ap= |
+| Pair vectors (ephemeron) | =ephemeron_ap= |
+
+** Immovable allocation (=alloc_immovable=)
+
+Used for objects that must not move (thread_state, module global refs):
+
+#+BEGIN_SRC c
+alloc_immovable (size, type)
+{
+#if defined HAVE_MACGUI
+  if (mac_gui_thread_p ())
+    {
+      if (!gui_gc_info)
+        igc_register_gui_thread ();
+      ap = gui_gc_info->immovable_ap;
+    }
+  else
+#endif
+    ap = current_thread->gc_info->d.immovable_ap;
+  return alloc_impl (size, type, ap);
+}
+#+END_SRC
+
+Currently never called from the GUI thread (module refs and thread_state
+objects are Lisp-only), but guarded for correctness.
+
+* GC Flips and Thread Suspension
+
+** What happens during a flip
+
+1. MPS decides a flip is needed (arena step, allocation buffer full, or
+   explicit collection request)
+
+2. MPS suspends ALL registered threads:
+   - Lisp thread: registered via =mps_thread_reg= during init
+   - GUI thread: registered via =igc_register_gui_thread= lazily
+
+3. Suspension mechanism:
+
+| Platform | Mechanism | Safe during semaphore wait? |
+|----------+-----------+---------------------------|
+| macOS    | Mach =thread_suspend= | Yes (kernel-level, any state) |
+| Linux    | =SIGXFSZ= / =SIGXCPU= signal | Yes (signal always deliverable) |
+| Windows  | =SuspendThread= | Yes (kernel-level, any state) |
+
+4. MPS scans all registered threads' roots:
+   - Control stacks: ambiguous scan (=scan_ambig=)
+   - Specpdl: exact scan (=scan_specpdl=)
+   - Bytecode stacks: ambiguous scan (=scan_bc=)
+
+5. MPS resolves references, moves objects, updates pointers
+
+6. MPS resumes all threads
+
+** Why cross-thread dispatch is safe during flips
+
+The =sync_call_on_gui_thread= pattern:
+
+```
+Lisp thread                     GUI thread
+─────────────                   ──────────
+sync_call_on_gui_thread(fn,data)
+  push to gui_queue
+  signal gui_semaphore ──────→  wakes from event loop
+                                   dequeue fn(data)
+  wait on lisp_semaphore ←────    execute fn(data)
+  ←── MPS FLIP ──────────────    ←── FLIP ───
+  (suspended by MPS)              (suspended by MPS)
+  ←── FLIP END ──────────────    ←── END ───
+  (resumed)                       (resumed)
+                                   signal lisp_semaphore
+  wakes from semaphore           back to event loop
+```
+
+Mach =thread_suspend= works regardless of the target thread's state:
+blocked on a semaphore, mutex, or running. When the flip ends, all
+threads resume exactly where they were -- the semaphore wait continues,
+the mutex lock is still pending, etc. No corruption.
+
+* Finalization
+
+** Arena parking during finalization
+
+In =process_one_message= (igc.c:4790), when a finalization message is
+processed:
+
+#+BEGIN_SRC c
+if (type == mps_message_type_finalization ())
+  {
+    specpdl_ref park_count = igc_park_arena ();
+    finalize (gc, addr);
+    unbind_to (park_count, Qnil);
+  }
+#+END_SRC
+
+=igc_park_arena= calls =mps_arena_park= which prevents new GC flips from
+starting. This ensures:
+
+- No thread is suspended while the finalizer runs
+- Objects being finalized don't move during the operation
+- The GUI thread (registered with MPS) is not suspended mid-finalizer
+
+Without parking, a flip could suspend the GUI thread while it's blocked
+in a cross-thread dispatch that only the finalizing Lisp thread can
+service, causing a deadlock.
+
+** Thread safety assertions
+
+=thread_ap()= asserts =current_thread->gc_info != NULL= on the Lisp
+thread path (igc.c:5037-5038).  The GUI thread path returns early
+(before the assertions) via the =HAVE_MACGUI= guard.
+
+* Profiler Signal Handler
+
+** Issue
+
+On macOS dual-thread mode, =SIGPROF= is delivered to the main thread
+(the GUI thread). The profiler signal handler calls =igc_busy_p()=
+which calls =mps_arena_busy()=, acquiring the MPS arena lock.  If MPS
+is in the middle of a flip (trying to suspend the GUI thread), calling
+=mps_arena_busy= from the signal handler would deadlock.
+
+** Fix
+
+=add_sample= in =profiler.c= (line 349) skips the =igc_busy_p= check
+when called from the GUI thread:
+
+#+BEGIN_SRC c
+#if defined HAVE_MACGUI
+  skip_gc_check = mac_gui_thread_p ();
+#endif
+  if (!skip_gc_check && igc_busy_p ())
+    return;
+#+END_SRC
+
+Results in a profiler sample being taken even during GC when on the
+GUI thread -- acceptable because GUI-thread profiler samples are for
+display/event processing and GC-time attribution is approximate anyway.
+
+* Scan Functions
+
+** scan_bc (bytecode stack)
+
+The =scan_bc= function (igc.c:1782) scans the Lisp thread's bytecode
+stack during GC flips.  It was previously using a =HORRIBLE_ESTIMATE=
+of 1024 bytes to determine the scan range, which could miss valid
+references in deep bytecode frames.
+
+Fix: scan from =bc->fp= (current frame pointer) to =bc->stack_end=
+(end of allocated bytecode stack).  If =bc->fp= is NULL (no active
+bytecode), return immediately.
+
+#+BEGIN_SRC c
+if (!bc->fp)
+  return MPS_RES_OK;
+
+char *scan_start = (char *) bc->fp;
+char *scan_end = bc->stack_end;
+// clamp to allocated bounds
+if (scan_end > scan_start)
+  IGC_FIX_CALL (ss, scan_ambig (ss, scan_start, scan_end, NULL));
+#+END_SRC
+
+This is an ambiguous scan -- every word-sized value in the scan range
+is treated as a potential tagged =Lisp_Object= reference.  Safe and
+complete.
+
+* Thread-Safety Rules
+
+| Rule | Description |
+|------+-------------|
+| 1 | GUI thread allocates via its own =gui_gc_info= allocation points |
+| 2 | GUI thread accesses =Lisp_Object= only through =sync_call_on_lisp_thread= or via =igc_park_arena= |
+| 3 | GUI thread never calls =igc_park_arena()= (reserved for Lisp thread specpdl context) |
+| 4 | Lisp thread never accesses GUI thread's =gui_gc_info= (it's the GUI thread's private allocation state) |
+| 5 | Both threads are registered with MPS → both are suspended during flips |
+| 6 | =process_one_message= parks arena during finalization → no flip during finalizer execution |
+| 7 | Profiler signal handler skips =igc_busy_p= on GUI thread → no deadlock from SIGPROF |
+| 8 | =gui_gc_info= is volatile → prevents compiler from eliding the NULL check across threads |
+
+* File Reference
+
+| File | Relevant sections |
+|------+------------------|
+| =src/igc.c= | =igc_register_gui_thread= (line 4031), =igc_deregister_gui_thread= (line 4092), =thread_ap= (line 5006), =thread_ap_for_type= (line 5048), =alloc_immovable= (line 5310), =process_one_message= (line 4790), =scan_bc= (line 1782), =gui_gc_info= (line 4029) |
+| =src/igc.h= | Declarations (line 161-162), non-HAVE_MPS stubs (line 176-177) |
+| =src/sync.h= | IGC safety documentation (lines 3-30) |
+| =src/event-loop.h= | IGC safety documentation (lines 8-20) |
+| =src/profiler.c= | =add_sample= GUI thread guard (lines 352-356) |
+| =src/thread.c= | =gui_try_acquire_global_lock= (line 1272) |
+| =src/thread.h= | Declarations (line 363-364) |
+
+* Change History
+
+| Date | Change |
+|------+--------|
+| 2026-04-29 | Initial IGC integration: GUI thread MPS registration, lazy init in =thread_ap=, finalization arena parking, =scan_bc= fix, profiler signal handler guard |

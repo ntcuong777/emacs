@@ -1,0 +1,499 @@
+#+TITLE: Emacs Cross-Platform Dual-Thread UI Model: Implementation Plan
+#+DATE: 2026-04-29
+#+AUTHOR: Emacs Development
+
+* Overview
+
+This document describes the plan to adopt and generalize the
+=emacs-mac= dual-thread UI model across all Emacs platforms (X11,
+Wayland, Windows, NS, TTY) and integrate it with the MPS incremental
+garbage collector.
+
+* Architecture
+
+** Current state (single-threaded)
+
+All Emacs platforms (except emacs-mac) run on a single thread:
+- Lisp evaluation, redisplay, and native GUI I/O all compete on one
+  thread
+- Blocking operations (file I/O, process calls, font loading) freeze
+  the UI
+- =block_input()/=unblock_input()= prevents SIGIO reentry but does
+  not prevent UI freeze
+
+** Target state (dual-threaded)
+
+Two threads:
+- *GUI thread* (main/initial thread): runs native GUI event loop,
+  handles all drawing/image/font/input operations via platform APIs
+- *Emacs/Lisp thread* (background): runs Lisp evaluation, redisplay
+  glyph generation, buffer management, most of ~1.5M lines of C code
+
+Threads communicate via a platform-independent dispatch layer:
+- =sync_call_on_thread()=: synchronous cross-thread call (blocks
+  caller, runs callback on target thread)
+- =sync_defer_to_thread()=: one-way deferred execution (fire and
+  forget)
+- =event_loop_select()=: I/O multiplexer that coordinates both
+  threads' event loops
+
+** Terminology
+
+| Term | Meaning |
+|------|---------|
+| GUI thread | Main/initial thread (~pthread_main_np), runs native event loop |
+| Lisp thread | Background thread created by =main()=, runs =emacs_main()= |
+| dual_thread_p | Flag on =struct terminal=, true when separate GUI thread active |
+| call_on_gui_thread | Terminal hook for dispatching work to GUI thread |
+| threaded_select_hook | Terminal hook replacing =pselect= for dual-thread select emulation |
+
+* Phase 1: Core Abstraction Layer
+
+Create two new files and update existing headers.
+
+** 1.1 =src/sync.h= -- Cross-thread dispatch API
+
+Declare:
+- =gui_thread_p(struct terminal *) → bool=: check if current thread
+  is the GUI thread for this terminal
+- =gui_assert_thread(struct terminal *)=: abort if not on GUI thread
+- =sync_call_on_thread(struct terminal *, bool to_gui, sync_block_fn,
+  void *data)=: synchronous dispatch
+- =sync_defer_to_thread(struct terminal *, bool to_gui, sync_block_fn,
+  void *data)=: deferred dispatch
+- =sync_sem_pair_t=: bidirectional semaphore pair (replaces
+  =dispatch_semaphore_t= pair)
+- =sync_block_queue_t=: thread-safe block queue (replaces
+  =NSMutableArray= block queues)
+- =sync_wakeup_fd_t=: wakeup mechanism (replaces
+  =mac_select_fds[]= + =dispatch_source_t=)
+
+** 1.2 =src/sync.c= -- Implementation (POSIX, macOS, Windows)
+
+Provide three platform implementations using #ifdef:
+
+*** POSIX (Linux/BSD, Fallback)
+
+- Semaphore pair: =pthread_mutex_t= + two =pthread_cond_t=s
+- Block queue: linked list protected by =pthread_mutex_t=
+- Wakeup: =eventfd= (Linux) or socketpair (BSD)
+- Thread identity: =syscall(SYS_gettid)= or =pthread_self()=
+- cross-thread call: push block to target queue, signal waiter, block
+  on semaphore until completion
+
+*** macOS (HAVE_MACGUI)
+
+- Thin wrappers over existing GCD:
+  - =sync_sem_pair_t= → =dispatch_semaphore_t= pair (existing
+    =mac_gui_semaphore= / =mac_lisp_semaphore=)
+  - =sync_block_queue_t= → =NSMutableArray= (existing =mac_gui_queue=
+    / =mac_lisp_queue= / =mac_deferred_lisp_queue=)
+  - =sync_wakeup_fd_t= → socketpair (=mac_select_fds[]) +
+    dispatch_source (=mac_select_dispatch_source=)
+- =gui_thread_p()=: =pthread_main_np()= (same as existing
+  =mac_gui_thread_p()=)
+
+*** Windows (WINDOWSNT)
+
+- Semaphore pair: =CRITICAL_SECTION= + two manual-reset events
+- Block queue: =SLIST_HEADER= (interlocked singly-linked list)
+- Wakeup: =CreateEvent= + =WSACreateEvent= for select integration
+- Thread identity: =GetCurrentThreadId()=
+- GUI thread check: compare against stored GUI thread id
+
+** 1.3 =src/event-loop.h= -- Event loop API
+
+Declare:
+- =event_loop_select(struct terminal *, int nfds, fd_set *rfds, fd_set
+  *wfds, fd_set *efds, struct timespec *timeout, sigset_t *sigmask)=
+  → int
+- =event_loop_run_gui(struct terminal *)=: enter GUI thread's event
+  loop (never returns)
+- =event_loop_wakeup_fd(struct terminal *)=: returns the fd used to
+  wake the Emacs thread from select
+- =event_loop_init(struct terminal *)=: initialize event loop state
+  for a terminal
+- =event_loop_deinit(struct terminal *)=: cleanup
+
+** 1.4 =src/event-loop.c= -- Implementation
+
+The core select replacement (replaces =mac_select= pattern
+generically):
+
+1. Quick poll: run GUI event pump once while doing 0-timeout pselect
+   in Emacs thread
+2. If events pending: return EINTR
+3. Blocking phase: run GUI run loop (NSRunLoop / GMainLoop / Windows
+   MsgWait) on GUI thread while Emacs thread does blocking
+   =thread_select(pselect)=
+4. Wakeup coordination:
+   - GUI → Emacs: write to wakeup fd (or signal event object)
+   - Emacs → GUI: via =sync_call_on_thread= mechanism
+
+** 1.5 Update =struct terminal= (=termhooks.h=)
+
+Add after line 564 (the =display_info= union, inside non-GC-traced
+section):
+
+#+BEGIN_SRC c
+  /* Dual-thread UI support.  */
+  bool dual_thread_p;
+  sys_thread_t gui_thread_id;
+
+  /* Opaque state for sync and event-loop layers.  */
+  void *sync_state;
+  void *evloop_state;
+
+  /* Dispatch work to the GUI thread synchronously.
+     Must be safe to call from any thread.
+     If already on GUI thread, call FN(DATA) directly.  */
+  void (*call_on_gui_thread) (struct terminal *,
+                              void (*fn) (void *), void *data);
+
+  /* Deferred dispatch to the GUI thread.
+     Returns immediately; FN is queued for execution on the GUI
+     thread at the next opportunity.  */
+  void (*defer_to_gui_thread) (struct terminal *,
+                               void (*fn) (void *), void *data);
+
+  /* Dispatch work to the Emacs (Lisp) thread.
+     Used from GUI callbacks to evaluate Lisp.  */
+  void (*call_on_lisp_thread) (struct terminal *,
+                               void (*fn) (void *), void *data);
+
+  /* Thread-aware select replacement.
+     Replaces pselect/thread_select when dual_thread_p is true.  */
+  int (*threaded_select_hook) (struct terminal *,
+                               int, fd_set *, fd_set *, fd_set *,
+                               struct timespec *, sigset_t *);
+
+  /* Try to acquire the Emacs GIL from the GUI thread.
+     Returns 0 on success, EBUSY if lock not immediately available.
+     Used for buffer/glyph matrix access during display handoff.  */
+  int (*try_acquire_gil_hook) (struct terminal *);
+  void (*release_gil_hook) (struct terminal *);
+#+END_SRC
+
+** 1.6 Update =terminal.c=
+
+In =create_terminal()= (line 304), add initialization:
+
+#+BEGIN_SRC c
+  terminal->dual_thread_p = false;
+  terminal->gui_thread_id = 0;
+  terminal->sync_state = NULL;
+  terminal->evloop_state = NULL;
+  terminal->call_on_gui_thread = NULL;
+  terminal->defer_to_gui_thread = NULL;
+  terminal->call_on_lisp_thread = NULL;
+  terminal->threaded_select_hook = NULL;
+  terminal->try_acquire_gil_hook = NULL;
+  terminal->release_gil_hook = NULL;
+#+END_SRC
+
+** 1.7 Update =thread.c= / =thread.h=
+
+Generalize =thread_try_acquire_global_lock()= from
+=#ifdef HAVE_MACGUI= to all platforms:
+
+- Move =thread_try_acquire_global_lock()= out of =#ifdef HAVE_MACGUI=
+  block (make always available when THREADS_ENABLED)
+- Rename to =gui_try_acquire_global_lock()= for clarity
+- Same for =thread_release_global_lock()= → =gui_release_global_lock()=
+
+#+BEGIN_SRC c
+  /* thread.h additions */
+  #ifdef THREADS_ENABLED
+  extern int gui_try_acquire_global_lock (void);
+  extern int gui_release_global_lock (void);
+  #endif
+#+END_SRC
+
+** 1.8 Update =lisp.h=
+
+Replace =#ifdef HAVE_MACGUI= block (lines 6032-6069) with new
+always-available declarations:
+
+#+BEGIN_SRC c
+  /* Dual-thread UI support.  Defined in sync.c.  */
+  extern bool gui_thread_p (struct terminal *);
+  extern void sync_call_on_gui_thread (struct terminal *,
+                                       void (*) (void *), void *);
+  extern void sync_defer_to_gui_thread (struct terminal *,
+                                        void (*) (void *), void *);
+  extern int event_loop_select (struct terminal *,
+                                int, fd_set *, fd_set *, fd_set *,
+                                struct timespec *, sigset_t *);
+  extern void event_loop_run_gui (struct terminal *);
+
+  /* Defined in emacs.c */
+  extern int emacs_main (int, char **);
+
+  #ifdef HAVE_MACGUI
+  /* Legacy compatibility wrappers.  */
+  extern bool mac_gui_thread_p (void);
+  extern void mac_within_gui (void (^) (void));
+  extern void mac_handle_alarm_signal (void);
+  extern void mac_within_lisp_deferred_if_gui_thread (void (^) (void));
+  extern void *mac_alloc_autorelease_pool (void);
+  extern void mac_release_autorelease_pool (void *);
+  #endif
+#+END_SRC
+
+** 1.9 Update =Makefile.in=
+
+Add =sync.o event-loop.o= to =base_obj= line:
+
+#+BEGIN_SRC makefile
+  base_obj = ... thread.o systhread.o sync.o event-loop.o sqlite.o ...
+#+END_SRC
+
+* Phase 2: Port emacs-mac to the new abstraction
+
+For each Mac-specific sync construct, provide a thin bridge function.
+
+** 2.1 =macterm.h= additions
+
+Add new declarations:
+
+#+BEGIN_SRC c
+  /* New terminal hooks for mac port (used by sync.c/event-loop.c).  */
+  extern void mac_call_on_gui_thread (struct terminal *,
+                                      void (*) (void *), void *);
+  extern void mac_defer_to_gui_thread (struct terminal *,
+                                       void (*) (void *), void *);
+  extern void mac_call_on_lisp_thread (struct terminal *,
+                                       void (*) (void *), void *);
+  extern int mac_threaded_select (struct terminal *,
+                                  int, fd_set *, fd_set *, fd_set *,
+                                  struct timespec *, sigset_t *);
+  extern int mac_try_acquire_gil (struct terminal *);
+  extern int mac_release_gil (struct terminal *);
+
+  /* Legacy compatibility macros.  */
+  #define mac_within_gui(block)                                        \
+    do {                                                                 \
+      void *data = (__bridge_retained void *) [block copy];            \
+      sync_call_on_gui_thread (mac_terminal, mac_block_dispatcher, data); \
+    } while (0)
+#+END_SRC
+
+** 2.2 =macappkit.m= changes
+
+Replace direct GCD usage with =sync.h= API:
+
+| Old (macappkit.m) | New (via sync.h wrappers) |
+|-------------------|--------------------------|
+| =dispatch_semaphore_t mac_gui_semaphore=, =mac_lisp_semaphore= | =sync_sem_pair_t *mac_sync_pair= |
+| =NSMutableArray *mac_gui_queue=, =*mac_lisp_queue=, =*mac_deferred_lisp_queue= | =sync_block_queue_t *mac_gui_queue=, =*mac_lisp_queue=, =*mac_deferred_lisp_queue= |
+| =dispatch_source_t mac_select_dispatch_source= | =sync_wakeup_fd_t mac_wakeup= |
+| =mac_init_thread_synchronization()= | =sync_init(terminal)= |
+| =mac_gui_loop()= | =event_loop_run_gui(terminal)= |
+| =mac_within_gui_and_here(block_gui, block_here)= | =sync_call_on_thread(t, true, block_gui)+block_here+wait= |
+| =mac_within_gui_allowing_inner_lisp(block)= | =sync_call_on_gui_thread(t, block)+inner_lisp_loop= |
+| =mac_within_lisp(block)= | =sync_call_on_lisp_thread(t, block)= |
+| =mac_within_lisp_deferred(block)= | =sync_defer_to_lisp_thread(t, block)= |
+| =mac_select(nfds, rfds, ..., sigmask)= | =event_loop_select(terminal, nfds, ..., sigmask)= |
+| =mac_gui_thread_p()= | =gui_thread_p(terminal)= |
+| =main()= (startup) | Initialize sync, create lisp thread, call =event_loop_run_gui= |
+
+** 2.3 =macterm.c= changes
+
+In =mac_create_terminal()= (line 5794), set new hooks:
+
+#+BEGIN_SRC c
+  terminal->dual_thread_p = true;
+  terminal->gui_thread_id = pthread_main_np ();
+  terminal->call_on_gui_thread = mac_call_on_gui_thread;
+  terminal->defer_to_gui_thread = mac_defer_to_gui_thread;
+  terminal->call_on_lisp_thread = mac_call_on_lisp_thread;
+  terminal->threaded_select_hook = mac_threaded_select;
+  terminal->try_acquire_gil_hook = mac_try_acquire_gil;
+  terminal->release_gil_hook = mac_release_gil;
+#+END_SRC
+
+** 2.4 Compatibility macros
+
+For the ~93 existing =mac_within_gui(^{...})= call sites across
+=macfns.c=, =macselect.c=, =macmenu.c=, =mac.c=, =nsxwidget.m=,
+provide a backward-compatible =mac_within_gui= macro that delegates to
+=call_on_gui_thread=:
+
+#+BEGIN_SRC c
+  /* macterm.h compatibility macro */
+  #define mac_within_gui(block)                                         \
+    do {                                                                 \
+      void (^__block_copy)(void) = MRC_AUTORELEASE ([block copy]);       \
+      struct terminal *__t = mac_terminal;  /* FIXME: get current terminal */ \
+      __t->call_on_gui_thread (__t, mac_block_shim, (__bridge void *)__block_copy); \
+    } while (0)
+#+END_SRC
+
+* Phase 3: Port X11 to Dual-Thread Model
+
+** Strategy
+
+X11 uses Xlib which is NOT thread-safe by default. Use *proxy pattern*
+--- all Xlib calls dispatched to GUI thread via
+=call_on_gui_thread=.
+
+** 3.1 =xterm.c= changes
+
+- In =x_term_init()=: after =XOpenDisplay()=, set
+  =terminal->dual_thread_p = true=
+- Create GUI thread (or use one created by event-loop layer)
+- All ~15 =rif= drawing methods: wrap in
+  =terminal->call_on_gui_thread()=
+- ~2000 =block_input()=/=unblock_input()= pairs: audit for direct
+  Xlib calls. In dual-thread mode, =block_input= is no-op (no SIGIO on
+  GUI thread); but any Xlib code still must dispatch to GUI thread.
+
+** 3.2 GTK+ considerations
+
+GTK requires =gtk_init()= on the GUI thread. In dual-thread mode:
+- Delay GTK init until GUI thread is running
+- Use =g_idle_add()= to dispatch Lisp-thread work to GTK main loop
+- =xg_select()= delegates to =event_loop_select()=
+
+* Phase 4: Port Windows to Dual-Thread Model
+
+W32 has better inherent thread separation:
+- GDI calls are per-DC, not per-thread
+- =SendMessage()= between threads marshals automatically
+- Key change: create all HWNDs on the GUI thread
+
+** 4.1 =w32term.c= changes
+
+- =w32_read_socket()=: GUI thread runs message pump, Emacs thread
+  drains kbd_buffer
+- Window procedure runs on GUI thread (Win32 requirement), dispatch
+  Lisp callbacks via =defer_to_lisp_thread()
+- Sys_select integration via =MsgWaitForMultipleObjects()=
+
+* Phase 5: TTY and NS
+
+** TTY
+
+TTY has no native GUI event loop. =dual_thread_p = false= for TTY
+terminals. All new hooks remain NULL; single-threaded fallback applies
+(nothing changes).
+
+** NS (GNUstep)
+
+The emacs-mac port IS the NS dual-thread implementation. Phase 2
+already covers this. The GNUstep NS port (=nsterm.m=) should adopt
+emacs-mac's approach (the mac port is based on emacs-mac which
+diverged from the old Emacs NS port).
+
+* Phase 6: IGC/MPS Integration
+
+** Known gaps
+
+1. =src/igc.c:4683=: "other threads should be suspended while
+   finalizing objects" --- finalization runs without suspending other
+   threads; if GUI thread accesses buffers while finalizer runs, could
+   see inconsistent state.
+2. =scan_bc= uses =HORRIBLE_ESTIMATE = 1024= for bytecode stack bound
+   (line 1807) --- should be replaced with actual bound.
+
+** Changes
+
+| File | Change |
+|------|--------|
+| =src/igc.c:4668-4717= | Park arena before finalizing, release after |
+| =src/igc.c:1781-1807= | Replace =HORRIBLE_ESTIMATE= with actual bytecode stack bound |
+| =src/igc.h= | Export =igc_park_arena()=/=igc_release_arena()= for use by event-loop sync points |
+| =src/thread.c:827-828= | Register GUI thread with MPS if it ever allocates MPS memory |
+
+* Risk Assessment
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| X11 Xlib thread safety | HIGH | Proxy all Xlib calls. Start with rif methods only (15 methods cover 90% of Xlib calls). |
+| Deadlock: GIL ordering | HIGH | Enforce: always acquire GIL before =sync_call_on_thread=. GUI thread must NEVER block on GIL while holding GUI dispatch lock. |
+| GTK+ init thread | MEDIUM | Delay =gtk_init()= until GUI thread exists. |
+| Performance regression | MEDIUM | Cross-thread dispatch ~5-50µs. Batch operations. Test: measure redisplay overhead. |
+| GC + GUI thread | MEDIUM | =block_input= protects GC. In dual-thread mode, GUI thread never allocates MPS memory, so it won't trigger GC. |
+| Autorelease pools (macOS) | LOW | Wrap each cross-thread call in pool push/pop. Existing =mac_autorelease_loop= pattern works. |
+
+* Execution Time Estimate
+
+| Phase | Weeks (2-3 person team) |
+|-------|--------------------------|
+| Phase 1: Core abstraction | 4 |
+| Phase 2: macOS port | 2 |
+| Phase 3: X11 port | 8 |
+| Phase 4: Windows port | 3 |
+| Phase 5: TTY/NS | 1 |
+| Phase 6: IGC integration | 2 |
+| Testing + stabilization | 4 |
+| **Total** | **~24** |
+
+* Immediate Next Steps
+
+1. Create =src/sync.h= with complete API declarations
+2. Create =src/sync.c= with POSIX implementation
+3. Create =src/event-loop.h= with event loop API
+4. Create =src/event-loop.c= with thread-aware select
+5. Update =termhooks.h= new fields in =struct terminal=
+6. Update =terminal.c= initialization
+7. Update =thread.c/h= generalize lock functions
+8. Update =Makefile.in= add new objects
+9. Write unit tests in =test/src/sync-tests.c=
+10. Port =macappkit.m= to new API
+11. Add =mac_call_on_gui_thread= etc. bridge functions
+12. Add compatibility macros for existing =mac_within_gui= calls
+
+* Phase 6: IGC/MPS Integration (complete)
+
+** Status: Implemented
+
+All Phase 6 changes have been implemented:
+
+1. **Finalization thread safety**: =process_one_message= in =src/igc.c=
+   now parks the MPS arena during object finalization, preventing GC
+   flips from suspending the GUI thread while finalizers run.
+
+2. **=scan_bc= fix for dual-thread**: Replaced =HORRIBLE_ESTIMATE= with
+   safe scanning from =bc->fp= to =bc->stack_end=.  This ensures bytecode
+   stack references are never missed, even with deep frames.
+
+3. **GUI thread safety assertion**: =thread_ap()= now asserts that
+   =current_thread->gc_info != NULL= before allocating, catching any
+   accidental allocation from the GUI thread at compile/debug time.
+
+** Integrated files
+
+| File | Change |
+|------|--------|
+| =src/igc.c:process_one_message= | Park arena during finalization |
+| =src/igc.c:scan_bc= | Replace =HORRIBLE_ESTIMATE= with =bc->stack_end= |
+| =src/igc.c:thread_ap= | Add =eassert= for =gc_info != NULL= |
+| =src/sync.h= | Add IGC safety documentation |
+| =src/event-loop.h= | Add IGC safety documentation |
+
+** Thread-safety rules (IGC + dual-thread UI)
+
+| Operation | Lisp Thread | GUI Thread |
+|-----------+-------------+------------|
+| Allocate GC objects | Yes (via =igc_alloc_*=) | **Yes** (via =main_thread.s.gc_info=) |
+| Access =Lisp_Object=s | Yes | Only via =sync_call_on_lisp_thread= |
+| Call =igc_park_arena= | Yes (blocks if GC active) | **NO** (only Lisp thread context) |
+| Be suspended by MPS | **Yes** (registered via =mps_thread_reg=) | **NO** (not registered) |
+| Read buffer/glyph data | Yes | Via GIL trylock only |
+| Process finalization | Yes (=igc_on_idle=) | No |
+
+**Key change**: =igc_register_gui_thread()= now registers the GUI
+thread with MPS lazily from =thread_ap()= on first allocation.  Each
+thread has its own =mps_thread_reg=, allocation points, and C stack
+root.  MPS suspends BOTH threads during GC flips (on macOS via Mach
+=thread_suspend=, which works regardless of thread state).
+
+During GC flips:
+- MPS suspends both Lisp and GUI threads (both registered)
+- =process_one_message= parks the arena during finalization to prevent
+  flips from suspending threads mid-finalizer
+- The GUI thread's C stack is scanned for =Lisp_Object= references,
+  preventing premature collection of objects held in local variables
+- Cross-thread dispatch is safe because =thread_suspend= preserves the
+  dispatch state (semaphore waits etc.)

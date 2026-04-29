@@ -21,6 +21,9 @@ along with GNU Emacs Mac port.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "blockinput.h"
 
 #include "macterm.h"
+#include "gc-handles.h"
+#include "thread.h"
+#include "sync.h"
 
 #include <sys/socket.h>
 
@@ -10806,8 +10809,12 @@ static NSString *localizedMenuTitleForEdit, *localizedMenuTitleForHelp, *localiz
 	 objCType:@encode(Lisp_Object)] when USE_LISP_UNION_TYPE
 	 defined, because NSGetSizeAndAlignment does not support bit
 	 fields (at least as of Mac OS X 10.5).  */
+      /* wv->help is a gc_handle; extract the Lisp_Object via
+	 gc_handle_value before passing to initWithLispObject.
+	 Under IGC, gc_handle and Lisp_Object are different pointer
+	 types — passing one as the other corrupts memory.  */
       EmacsWeakLispObject *weakLispObject =
-	[[EmacsWeakLispObject alloc] initWithLispObject:wv->help];
+	[[EmacsWeakLispObject alloc] initWithLispObject:gc_handle_value (wv->help)];
       item.representedObject = weakLispObject;
       MRC_RELEASE (weakLispObject);
 
@@ -16890,6 +16897,111 @@ mac_within_lisp_deferred_if_gui_thread (void (^block) (void))
 
 
 /***********************************************************************
+	    Bridge functions for terminal->call_on_gui_thread etc.
+
+   These bridge the C callback-based sync.h API with the ObjC block
+   implementation.  They allow terminal hooks to be implemented via
+   the existing mac_within_gui family of functions.
+
+   Each bridge function wraps a C (fn, data) pair into an ObjC block
+   and dispatches through the existing mac_* infrastructure.
+***********************************************************************/
+
+/* Helper struct to pass a C function + data pointer through an
+   ObjC block.  The block captures this by reference (malloc'd),
+   invokes fn(data), then frees it.  */
+struct mac_c_callback {
+  void (*fn) (void *);
+  void *data;
+};
+
+/* Call FN(DATA) on the GUI thread.  Wraps them in an ObjC block and
+   dispatches via the existing mac_within_gui.  */
+void
+mac_call_on_gui_thread (struct terminal *terminal,
+			void (*fn) (void *), void *data)
+{
+  void (^block) (void);
+  struct mac_c_callback *cb;
+
+  /* If already on GUI thread, call directly.  */
+  if (mac_gui_thread_p ())
+    {
+      fn (data);
+      return;
+    }
+
+  cb = malloc (sizeof *cb);
+  cb->fn = fn;
+  cb->data = data;
+
+  block = ^{
+    cb->fn (cb->data);
+    free (cb);
+  };
+
+  mac_within_gui (block);
+}
+
+/* Enqueue FN(DATA) for deferred execution on the GUI thread.  */
+void
+mac_defer_to_gui_thread (struct terminal *terminal,
+			  void (*fn) (void *), void *data)
+{
+  void (^block) (void);
+
+  if (mac_gui_thread_p ())
+    {
+      fn (data);
+      return;
+    }
+
+  block = ^{ fn (data); };
+  [mac_gui_queue enqueue: MRC_AUTORELEASE ([block copy])];
+  dispatch_source_merge_data (mac_select_dispatch_source,
+			      MAC_SELECT_COMMAND_SUSPEND);
+  dispatch_semaphore_signal (mac_gui_semaphore);
+}
+
+/* Call FN(DATA) on the Lisp thread synchronously.
+   Bridges to mac_within_lisp.  */
+void
+mac_call_on_lisp_thread (struct terminal *terminal,
+			  void (*fn) (void *), void *data)
+{
+  void (^block) (void) = ^{ fn (data); };
+
+  mac_within_lisp (block);
+}
+
+/* Try to acquire the GIL from the GUI thread.  */
+int
+mac_try_acquire_gil (struct terminal *terminal)
+{
+  return gui_try_acquire_global_lock ();
+}
+
+/* Release the GIL from the GUI thread.  */
+void
+mac_release_gil (struct terminal *terminal)
+{
+  gui_release_global_lock ();
+}
+
+/* Threaded select implementation for mac port.
+   Delegates to the existing mac_select function which coordinates
+   the NSRunLoop (GUI thread) with pselect (Lisp thread).  */
+int
+mac_threaded_select (struct terminal *terminal,
+		     int nfds, fd_set *rfds, fd_set *wfds,
+		     fd_set *efds, struct timespec *timeout,
+		     sigset_t *sigmask)
+{
+  return mac_select (nfds, rfds, wfds, efds, timeout, sigmask);
+}
+
+
+/***********************************************************************
 			   Select emulation
 ***********************************************************************/
 
@@ -17005,7 +17117,7 @@ static bool
 mac_try_buffer_and_glyph_matrix_access (void)
 {
   if (mac_buffer_and_glyph_matrix_access_restricted_p)
-    return !thread_try_acquire_global_lock ();
+    return !gui_try_acquire_global_lock ();
 
   return true;
 }
@@ -17014,7 +17126,7 @@ static void
 mac_end_buffer_and_glyph_matrix_access (void)
 {
   if (mac_buffer_and_glyph_matrix_access_restricted_p)
-    thread_release_global_lock ();
+    gui_release_global_lock ();
 }
 
 int

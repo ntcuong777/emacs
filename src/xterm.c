@@ -707,6 +707,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "xwidget.h"
 #include "fontset.h"
 #include "termhooks.h"
+#include "sync.h"
+#include "event-loop.h"
 #include "termopts.h"
 #include "termchar.h"
 #include "emacs-icon.h"
@@ -30900,6 +30902,9 @@ x_term_init (Lisp_Object display_name, char *xrm_option, char *resource_name)
 
   terminal = x_create_terminal (dpyinfo);
 
+  /* Initialize dual-thread UI support for this terminal.  */
+  x_init_dual_thread (terminal, dpyinfo);
+
   if (!NILP (Vx_detect_server_trust))
     {
       /* Detect whether or not the X server trusts this client, which
@@ -32326,6 +32331,212 @@ x_create_terminal (struct x_display_info *dpyinfo)
   /* Other hooks are NULL by default.  */
 
   return terminal;
+}
+
+
+/***********************************************************************
+		     X11 Dual-Thread UI support
+
+   Bridge functions that implement the terminal->call_on_gui_thread etc.
+   hooks for X11.  When dual-thread mode is active, these dispatch
+   work to a separate GUI thread that handles X11 event processing
+   and drawing, preventing the Lisp thread from blocking on X
+   round-trips.
+
+   In single-threaded mode (dual_thread_p == false, the default for
+   now), these functions are called directly from the Lisp thread and
+   execute immediately.
+***********************************************************************/
+
+/* Wakeup fd for signalling the Emacs thread from the GUI thread.  */
+static int x_gui_wakeup_fds[2] = { -1, -1 };
+
+/* Initialize the wakeup pipe used for cross-thread signaling.
+   Called once when the first X11 dual-thread terminal is created.  */
+static void
+x_init_gui_wakeup (void)
+{
+  if (x_gui_wakeup_fds[0] >= 0)
+    return;  /* Already initialized.  */
+
+  if (socketpair (AF_UNIX, SOCK_STREAM, 0, x_gui_wakeup_fds) < 0)
+    {
+      emacs_perror ("Can't create GUI wakeup socketpair");
+      return;
+    }
+
+  for (int i = 0; i < 2; i++)
+    {
+      int flags = fcntl (x_gui_wakeup_fds[i], F_GETFL, 0);
+      if (flags >= 0)
+	fcntl (x_gui_wakeup_fds[i], F_SETFL, flags | O_NONBLOCK);
+      flags = fcntl (x_gui_wakeup_fds[i], F_GETFD, 0);
+      if (flags >= 0)
+	fcntl (x_gui_wakeup_fds[i], F_SETFD, flags | FD_CLOEXEC);
+    }
+
+  /* Register the wakeup read end as a keyboard wait descriptor
+     so the main event loop monitors it.  */
+  add_keyboard_wait_descriptor (x_gui_wakeup_fds[0]);
+}
+
+/* The GUI event processing thread function for X11.
+   Runs in a separate thread.  Monitors the X11 display connection
+   for events and processes them via handle_one_xevent, storing
+   results into kbd_buffer.
+
+   Currently a stub: dual-thread mode for X11 is infrastructure-only.
+   The actual thread spawn requires wrapping all ~2000 block_input
+   sites and handle_one_xevent's internal global state.  */
+static void *
+x_gui_event_thread (void *arg)
+{
+  struct terminal *terminal = arg;
+  struct x_display_info *dpyinfo = terminal->display_info.x;
+
+  pthread_setname_np ("org.gnu.Emacs.x11-gui");
+
+  /* GUI thread main loop.
+     Process cross-thread work dispatched via sync layer, and
+     poll for X events.  */
+  while (terminal->name != NULL)
+    {
+      struct sync_sem_pair *sp = sync_get_sem_pair (terminal);
+
+      /* Check for X events (non-blocking poll).  */
+      if (dpyinfo && dpyinfo->display)
+	{
+	  block_input ();
+	  while (XPending (dpyinfo->display))
+	    {
+	      XEvent event;
+	      int finish;
+
+	      XNextEvent (dpyinfo->display, &event);
+	      handle_one_xevent (dpyinfo, &event, &finish, NULL);
+	      if (finish == X_EVENT_GOTO_OUT)
+		break;
+	    }
+	  unblock_input ();
+
+	  /* Wake the Emacs thread if we processed events.  */
+	  sync_wakeup_signal (sync_get_wakeup (terminal));
+	}
+
+      /* Check for work from the Emacs thread (if sync layer active).  */
+      if (sp)
+	{
+	  sync_block_fn fn;
+	  void *data;
+	  if (sync_block_queue_pop (sync_get_gui_queue (terminal),
+				    &fn, &data))
+	    {
+	      fn (data);
+	      sync_sem_pair_signal (sp, 1);
+	    }
+	}
+
+      /* Yield CPU briefly to avoid busy-waiting.
+         FIXME: Use semaphore-based blocking when no work is pending.  */
+      struct timespec ts = make_timespec (0, 1000000);  /* 1ms */
+      nanosleep (&ts, NULL);
+    }
+
+  return NULL;
+}
+
+/* Call FN(DATA) on the X11 GUI thread synchronously.
+   In single-threaded mode (the default), calls directly.  */
+void
+x_call_on_gui_thread (struct terminal *terminal,
+		      void (*fn) (void *), void *data)
+{
+  /* For now, synchronous execution on Lisp thread.
+     FIXME: When dual-thread mode is enabled, dispatch via sync layer.  */
+  fn (data);
+}
+
+/* Deferred dispatch to X11 GUI thread.  */
+void
+x_defer_to_gui_thread (struct terminal *terminal,
+		       void (*fn) (void *), void *data)
+{
+  fn (data);
+}
+
+/* Call FN(DATA) on the X11 Lisp thread.
+   Used from GUI thread callbacks.  */
+void
+x_call_on_lisp_thread (struct terminal *terminal,
+		       void (*fn) (void *), void *data)
+{
+  fn (data);
+}
+
+/* Threaded select for X11.  Currently a stub that delegates to
+   the existing pselect mechanism.  */
+int
+x_threaded_select (struct terminal *terminal,
+		   int nfds, fd_set *rfds, fd_set *wfds, fd_set *efds,
+		   struct timespec *timeout, sigset_t *sigmask)
+{
+  /* In single-threaded mode, use thread_select directly.
+     In dual-thread mode, this would delegate to event_loop_select.  */
+  return thread_select (pselect, nfds, rfds, wfds, efds, timeout, sigmask);
+}
+
+/* Try to acquire the GIL from the X11 GUI thread.  */
+int
+x_try_acquire_gil (struct terminal *terminal)
+{
+  return gui_try_acquire_global_lock ();
+}
+
+/* Release the GIL from the X11 GUI thread.  */
+void
+x_release_gil (struct terminal *terminal)
+{
+  gui_release_global_lock ();
+}
+
+/* Initialize dual-thread UI for an X11 terminal.
+   Currently sets up the infrastructure hooks but keeps
+   dual_thread_p = false by default.  Set the environment
+   variable EMACS_X11_DUAL_THREAD=1 to enable.  */
+void
+x_init_dual_thread (struct terminal *terminal,
+		    struct x_display_info *dpyinfo)
+{
+  /* Set the bridge function hooks so cross-platform code
+     can use terminal->call_on_gui_thread etc.  */
+  terminal->call_on_gui_thread = x_call_on_gui_thread;
+  terminal->defer_to_gui_thread = x_defer_to_gui_thread;
+  terminal->call_on_lisp_thread = x_call_on_lisp_thread;
+  terminal->threaded_select_hook = x_threaded_select;
+  terminal->try_acquire_gil_hook = x_try_acquire_gil;
+  terminal->release_gil_hook = x_release_gil;
+
+  /* Check for opt-in via environment variable.  */
+  const char *env = getenv ("EMACS_X11_DUAL_THREAD");
+  if (env && env[0] == '1')
+    {
+      terminal->dual_thread_p = true;
+      terminal->gui_thread_id = sys_thread_self ();
+
+      /* Initialize the sync and event-loop layers.  */
+      sync_init_terminal (terminal);
+      event_loop_init (terminal);
+
+      /* Initialize the wakeup mechanism.  */
+      x_init_gui_wakeup ();
+      dpyinfo->event_wakeup_fd = x_gui_wakeup_fds[0];
+
+      /* Spawn the GUI event processing thread.  */
+      sys_thread_t gui_thread;
+      sys_thread_create (&gui_thread, x_gui_event_thread, terminal);
+
+      message ("X11 dual-thread UI enabled");
+    }
 }
 
 static void

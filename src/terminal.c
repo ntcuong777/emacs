@@ -306,6 +306,16 @@ create_terminal (enum output_method type, struct redisplay_interface *rif)
   terminal->type = type;
   terminal->rif = rif;
   terminal->id = next_terminal_id++;
+  terminal->dual_thread_p = false;
+  terminal->gui_thread_id = 0;
+  terminal->sync_state = NULL;
+  terminal->evloop_state = NULL;
+  terminal->call_on_gui_thread = NULL;
+  terminal->defer_to_gui_thread = NULL;
+  terminal->call_on_lisp_thread = NULL;
+  terminal->threaded_select_hook = NULL;
+  terminal->try_acquire_gil_hook = NULL;
+  terminal->release_gil_hook = NULL;
 
 #ifdef HAVE_MPS
   terminal->keyboard_coding = igc_alloc_coding_system ();

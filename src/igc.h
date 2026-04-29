@@ -154,6 +154,13 @@ void * w32_add_non_lisp_thread (void *);
 void w32_remove_non_lisp_thread (void *);
 #endif
 
+/* Register the GUI thread for MPS in the dual-thread UI model.
+   Called lazily from thread_ap() on first allocation from the
+   GUI thread.  Creates full allocation points and a stack root
+   so MPS can scan the GUI thread's C stack during flips.  */
+extern void igc_register_gui_thread (void);
+extern void igc_deregister_gui_thread (void);
+
 void igc_init_header (union igc_header *, enum igc_obj_type);
 void igc_init_header_bytes (union igc_header *,
 			    enum igc_obj_type type, size_t bytes);
@@ -165,6 +172,15 @@ extern void igc_scan_for_untraced_objects (void *start, void *end) EXTERNALLY_VI
 #else
 # define igc_break() (void) 0
 # define eassert_not_mps() (void) 0
+# define igc_register_gui_thread() (void) 0
+# define igc_deregister_gui_thread() (void) 0
+/* Stub returns for IGC allocation functions used by nsterm.m etc.
+   These are only available under HAVE_MPS; the stubs just return NULL
+   or call xmalloc/xfree.  */
+# define igc_xzalloc_ambig(size, label) xzalloc (size)
+# define igc_realloc_ambig(block, size) xrealloc (block, size)
+# define igc_xalloc_raw_exact(n, label) xzalloc (n)
+# define igc_xfree(p) xfree (p)
 #endif 	/* HAVE_MPS */
 
 #endif	/* EMACS_IGC_H */

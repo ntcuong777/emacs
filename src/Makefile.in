@@ -473,7 +473,7 @@ base_obj = dispnew.o frame.o scroll.o xdisp.o menu.o $(XMENU_OBJ) window.o     \
 	doprnt.o intervals.o textprop.o composite.o xml.o lcms.o $(NOTIFY_OBJ) \
 	$(XWIDGETS_OBJ) 						       \
 	profiler.o decompress.o $(IGCOBJ) 				       \
-	thread.o systhread.o sqlite.o  treesit.o			       \
+	thread.o systhread.o sync.o event-loop.o sqlite.o  treesit.o	       \
 	itree.o json.o gc-handles.o					       \
 	$(MSDOS_OBJ) $(MSDOS_X_OBJ) $(MAC_OBJ) $(NS_OBJ) $(CYGWIN_OBJ) $(FONT_OBJ)        \
 	$(W32_OBJ) $(WINDOW_SYSTEM_OBJ) $(XGSELOBJ)			       \
@@ -494,6 +494,7 @@ SOME_MACHINE_OBJECTS = dosfns.o msdos.o \
   w32menu.o w32proc.o w32reg.o w32select.o w32term.o w32xfns.o \
   w16select.o widget.o xfont.o ftfont.o xftfont.o gtkutil.o \
   xsettings.o xgselect.o termcap.o hbfont.o \
+  sync.o event-loop.o \
   haikuterm.o haikufns.o haikumenu.o haikufont.o androidterm.o androidfns.o \
   androidfont.o androidselect.c androidvfs.c sfntfont-android.c sfntfont.c
 

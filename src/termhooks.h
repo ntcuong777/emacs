@@ -550,6 +550,55 @@ struct terminal
   /* The terminal's keyboard object. */
   struct kboard *kboard;
 
+  /* Non-nil means this terminal has a separate GUI thread for native
+     event processing and drawing.  The Emacs (Lisp) thread does
+     evaluation and redisplay glyph generation; drawing crosses the
+     thread boundary via call_on_gui_thread.  */
+  bool dual_thread_p;
+
+  /* OS thread ID of the GUI thread, valid when dual_thread_p is true.  */
+  sys_thread_t gui_thread_id;
+
+  /* Opaque state for the synchronization layer (sync.h).  */
+  void *sync_state;
+
+  /* Opaque state for the event-loop layer (event-loop.h).  */
+  void *evloop_state;
+
+  /* Dispatch FN(DATA) to the GUI thread and block the caller until
+     FN completes on the GUI thread.  If already on the GUI thread,
+     call FN(DATA) directly.  */
+  void (*call_on_gui_thread) (struct terminal *terminal,
+			      void (*fn) (void *), void *data);
+
+  /* Enqueue FN(DATA) for execution on the GUI thread and return
+     immediately without waiting for completion.  */
+  void (*defer_to_gui_thread) (struct terminal *terminal,
+			       void (*fn) (void *), void *data);
+
+  /* Dispatch FN(DATA) to the Emacs (Lisp) thread and block until
+     FN completes on the Emacs thread.  Used from GUI callbacks to
+     evaluate Lisp.  */
+  void (*call_on_lisp_thread) (struct terminal *terminal,
+			       void (*fn) (void *), void *data);
+
+  /* Thread-aware select replacement.  Replaces pselect/thread_select
+     when dual_thread_p is true.  Coordinates the GUI thread's native
+     event pump with the Emacs thread's I/O multiplexing.  */
+  int (*threaded_select_hook) (struct terminal *terminal,
+			       int nfds, fd_set *rfds, fd_set *wfds,
+			       fd_set *efds, struct timespec *timeout,
+			       sigset_t *sigmask);
+
+  /* Try to acquire the Emacs GIL from the GUI thread.
+     Returns 0 on success, EBUSY if the lock is not immediately
+     available.  Used for buffer/glyph matrix access from the GUI
+     thread when multiple Lisp threads may be running.  */
+  int (*try_acquire_gil_hook) (struct terminal *terminal);
+
+  /* Release the GIL previously acquired via try_acquire_gil_hook.  */
+  void (*release_gil_hook) (struct terminal *terminal);
+
   /* Device-type dependent data shared amongst all frames on this terminal.  */
   union display_info
   {

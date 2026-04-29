@@ -358,7 +358,7 @@ struct mac_output
 struct scroll_bar {
 
   /* These fields are shared by all vectors.  */
-  union vectorlike_header header;
+  struct vectorlike_header header;
 
   /* The window we're a scroll bar for.  */
   Lisp_Object window;
@@ -758,6 +758,23 @@ extern void mac_start_animation (Lisp_Object, Lisp_Object);
 extern CFTypeRef mac_sound_create (Lisp_Object, Lisp_Object);
 extern void mac_sound_play (CFTypeRef, Lisp_Object, Lisp_Object);
 extern void mac_within_gui (void (^block) (void));
+
+/* Terminal hook implementations for the dual-thread UI abstraction.
+   These bridge between ObjC block-based dispatch and C callback-based
+   sync.h API.  Defined in macappkit.m.  */
+extern void mac_call_on_gui_thread (struct terminal *,
+				    void (*fn) (void *), void *data);
+extern void mac_defer_to_gui_thread (struct terminal *,
+				     void (*fn) (void *), void *data);
+extern void mac_call_on_lisp_thread (struct terminal *,
+				     void (*fn) (void *), void *data);
+extern int mac_try_acquire_gil (struct terminal *);
+extern void mac_release_gil (struct terminal *);
+
+/* The threaded select implementation for mac.  */
+extern int mac_threaded_select (struct terminal *,
+				int, fd_set *, fd_set *, fd_set *,
+				struct timespec *, sigset_t *);
 
 #if DRAWING_USE_GCD
 #define MAC_BEGIN_DRAW_TO_FRAME(f, gc, rect, context)			\

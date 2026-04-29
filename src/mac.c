@@ -95,19 +95,28 @@ struct bstree_node
    to *BSTREE.  In the latter case, the variable pointed to by the
    return value contains NULL.  */
 
+/* Under MPS, objects can move, so address-based hashes (XHASH) are
+   not stable across GC cycles.  This BST is ephemeral — built and
+   used within a single Lisp call where no GC interleaves — so we can
+   use XUFIXNUM_RAW (the raw address tag bits) as the comparison key.
+   This is the same underlying value that XHASH would return without
+   the HAVE_MPS guard that disables it.  */
+#define BSTREE_HASH(o) XUFIXNUM_RAW (o)
+
 static struct bstree_node **
 bstree_find (struct bstree_node **bstree, Lisp_Object obj)
 {
   while (*bstree)
-    if (XHASH (obj) < XHASH ((*bstree)->obj))
+    if (BSTREE_HASH (obj) < BSTREE_HASH ((*bstree)->obj))
       bstree = &(*bstree)->left;
-    else if (XHASH (obj) > XHASH ((*bstree)->obj))
+    else if (BSTREE_HASH (obj) > BSTREE_HASH ((*bstree)->obj))
       bstree = &(*bstree)->right;
     else
       break;
 
   return bstree;
 }
+#undef BSTREE_HASH
 
 /* Return unibyte Lisp string representing four char code CODE.  */
 

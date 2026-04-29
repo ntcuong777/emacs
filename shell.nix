@@ -48,15 +48,19 @@ let
       flags;
 
   commonConfigureFlags = [
-    "--with-file-notification=fsevents"
-    "--with-threads=yes"
-    "--with-poll=yes"
+    # "--with-file-notification=fsevents"
+    # "--with-threads=yes"
+    # "--with-poll=yes"
+    "--enable-mac-app=$(pwd)/build/mac/"
   ];
 
   variantConfig = {
     forked-igc = {
       extraBuildInputs = [ pkgs.mps ];
-      extraConfigureFlags = [ "--with-mps=yes" ];
+      extraConfigureFlags = [
+        "--with-mps=debug"
+        "--enable-checking=igc_debug,igc_debug_alloc,igc_check_fwd"
+      ];
     };
     forked-master = {
       extraBuildInputs = [ ];
@@ -71,8 +75,8 @@ let
     NATIVE_FULL_AOT = "1";
     NIX_CFLAGS_COMPILE =
       (oa.env.NIX_CFLAGS_COMPILE or "")
-      + " -DNTCUONG_NS_DUAL_THREAD -DNTCUONG_CACHE_EXEC_PATH -DNTCUONG_NO_DUPLICATE_SIGPROF"
-      + " -DNTCUONG_POSIX_SPAWN_DARWIN -DNTCUONG_POSIX_SPAWN_PTY -DNTCUONG_NS_PARTIAL_IOSURFACE"
+      # + " -DNTCUONG_NS_DUAL_THREAD -DNTCUONG_CACHE_EXEC_PATH -DNTCUONG_NO_DUPLICATE_SIGPROF"
+      # + " -DNTCUONG_POSIX_SPAWN_DARWIN -DNTCUONG_POSIX_SPAWN_PTY -DNTCUONG_NS_PARTIAL_IOSURFACE"
       + " -DFD_SETSIZE=40960 -DDARWIN_UNLIMITED_SELECT -O2 -mcpu=native"
       + " -flto=thin";
     NIX_LDFLAGS =
@@ -80,7 +84,7 @@ let
       + " -lto_library ${pkgs.llvmPackages.libllvm.lib}/lib/libLTO.dylib";
   };
 
-  base = (pkgs.emacs.override {
+  base = (pkgs.emacs-macport.override {
     srcRepo = true;
     withXwidgets = false;
     withNativeCompilation = true;
@@ -108,6 +112,8 @@ let
 
 in pkgs.mkShell {
   inputsFrom = [ base ];
+
+  buildInputs = with pkgs; [ gmp ];
 
   inherit (shellEnv) NIX_CFLAGS_COMPILE NIX_LDFLAGS NATIVE_FULL_AOT;
 

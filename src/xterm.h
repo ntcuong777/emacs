@@ -986,6 +986,12 @@ struct x_display_info
 
   /* The last time that keysym was pressed.  */
   Time quit_keysym_time;
+
+  /* File descriptor for waking the Emacs thread from the GUI thread
+     when X events arrive.  Written by the GUI thread, polled by the
+     Emacs thread's select loop.  Only used when dual_thread_p is
+     true for the terminal.  */
+  int event_wakeup_fd;
 };
 
 #ifdef HAVE_XINPUT2
@@ -2027,6 +2033,27 @@ extern unsigned int xi_convert_event_state (XIDeviceEvent *);
 #endif
 
 extern void mark_xterm (void);
+
+/* Dual-thread UI bridge functions for X11.
+   These implement the terminal hooks for cross-thread dispatch.
+   Defined in xterm.c.  */
+extern void x_call_on_gui_thread (struct terminal *,
+				  void (*fn) (void *), void *data);
+extern void x_defer_to_gui_thread (struct terminal *,
+				   void (*fn) (void *), void *data);
+extern void x_call_on_lisp_thread (struct terminal *,
+				   void (*fn) (void *), void *data);
+extern int x_threaded_select (struct terminal *,
+			      int, fd_set *, fd_set *, fd_set *,
+			      struct timespec *, sigset_t *);
+extern int x_try_acquire_gil (struct terminal *);
+extern void x_release_gil (struct terminal *);
+
+/* Initialize dual-thread UI for an X11 terminal.
+   Spawns the GUI event processing thread.
+   Called from x_term_init.  */
+extern void x_init_dual_thread (struct terminal *,
+				struct x_display_info *);
 
 /* Is the frame embedded into another application? */
 
