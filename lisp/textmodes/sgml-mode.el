@@ -4,7 +4,7 @@
 ;; Foundation, Inc.
 
 ;; Author: James Clark <jjc@jclark.com>
-;; Maintainer: emacs-devel@gnu.org
+;; Maintainer: Philip Kaludercic <philipk@posteo.net>
 ;; Adapted-By: ESR, Daniel Pfeiffer <occitan@esperanto.org>,
 ;;             F.Potorti@cnuce.cnr.it
 ;; Keywords: text, hypermedia, comm, languages
@@ -2034,7 +2034,7 @@ This takes effect when first loading the library.")
       ("caption" ("valign" ("top") ("bottom")))
       ("center" \n)
       ("cite")
-      ("code" \n)
+      ("code")
       ("datalist" \n)
       ("dd" ,(not sgml-xml-mode))
       ("del" nil ("cite") ("datetime"))

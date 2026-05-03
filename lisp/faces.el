@@ -2405,11 +2405,15 @@ If you set `term-file-prefix' to nil, this function does nothing."
 
 ;; Called from C function init_display to initialize faces of the
 ;; dumped terminal frame on startup.
-
+(declare-function w32-tty-setup-colors "term/w32console" ())
 (defun tty-set-up-initial-frame-faces ()
-  (let ((frame (selected-frame)))
-    (frame-set-background-mode frame t)
-    (face-set-after-frame-default frame)))
+  (progn
+    (when (and (eq system-type 'windows-nt)
+               (featurep 'term/w32console))
+      (w32-tty-setup-colors))
+    (let ((frame (selected-frame)))
+      (frame-set-background-mode frame t)
+      (face-set-after-frame-default frame))))
 
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -3001,7 +3005,22 @@ Note: Other faces cannot inherit from the cursor face."
      :background "grey")
     (t
      :inverse-video t))
-  "Tab line face."
+  "Basic tab line face.
+See `tab-line-active' and `tab-line-inactive' for the faces
+used on tab lines."
+  :version "31.1"
+  :group 'basic-faces)
+
+(defface tab-line-active
+  '((t :inherit tab-line))
+  "Face for the selected tab line.
+This inherits from the `tab-line' face."
+  :version "31.1"
+  :group 'basic-faces)
+
+(defface tab-line-inactive
+  '((t :inherit tab-line))
+  "Basic tab line face for non-selected windows."
   :version "31.1"
   :group 'basic-faces)
 
