@@ -1449,6 +1449,9 @@ encode_coding_utf_8 (struct coding_system *coding)
 
       while (charbuf < charbuf_end)
 	{
+#ifdef USE_NS_YIELD
+	  maybe_quit ();
+#endif
 	  unsigned char str[MAX_MULTIBYTE_LENGTH], *p, *pend = str;
 
 	  ASSURE_DESTINATION (safe_room);
@@ -1472,6 +1475,9 @@ encode_coding_utf_8 (struct coding_system *coding)
 
       while (charbuf < charbuf_end)
 	{
+#ifdef USE_NS_YIELD
+	  maybe_quit ();
+#endif
 	  ASSURE_DESTINATION (safe_room);
 	  c = *charbuf++;
 	  if (CHAR_BYTE8_P (c))
@@ -1721,6 +1727,9 @@ encode_coding_utf_16 (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       ASSURE_DESTINATION (safe_room);
       c = *charbuf++;
       if (c > MAX_UNICODE_CHAR)
@@ -2579,6 +2588,9 @@ encode_coding_emacs_mule (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       ASSURE_DESTINATION (safe_room);
       c = *charbuf++;
 
@@ -4395,6 +4407,9 @@ encode_coding_iso_2022 (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       ASSURE_DESTINATION (safe_room);
 
       if (bol_designation)
@@ -4918,6 +4933,9 @@ encode_coding_sjis (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       ASSURE_DESTINATION (safe_room);
       c = *charbuf++;
       /* Now encode the character C.  */
@@ -5008,6 +5026,9 @@ encode_coding_big5 (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       ASSURE_DESTINATION (safe_room);
       c = *charbuf++;
       /* Now encode the character C.  */
@@ -5300,6 +5321,9 @@ encode_coding_raw_text (struct coding_system *coding)
       if (coding->src_multibyte)
 	while (charbuf < charbuf_end)
 	  {
+#ifdef USE_NS_YIELD
+	    maybe_quit ();
+#endif
 	    ASSURE_DESTINATION (safe_room);
 	    c = *charbuf++;
 	    if (ASCII_CHAR_P (c))
@@ -5320,6 +5344,9 @@ encode_coding_raw_text (struct coding_system *coding)
       else
 	while (charbuf < charbuf_end)
 	  {
+#ifdef USE_NS_YIELD
+	    maybe_quit ();
+#endif
 	    ASSURE_DESTINATION (safe_room);
 	    c = *charbuf++;
 	    EMIT_ONE_BYTE (c);
@@ -5333,6 +5360,9 @@ encode_coding_raw_text (struct coding_system *coding)
 
 	  while (charbuf < charbuf_end)
 	    {
+#ifdef USE_NS_YIELD
+	      maybe_quit ();
+#endif
 	      ASSURE_DESTINATION (safe_room);
 	      c = *charbuf++;
 	      if (ASCII_CHAR_P (c))
@@ -5609,6 +5639,9 @@ encode_coding_charset (struct coding_system *coding)
 
   while (charbuf < charbuf_end)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       struct charset *charset;
       unsigned code;
 
@@ -7973,6 +8006,12 @@ decode_coding_gap (struct coding_system *coding, ptrdiff_t bytes)
 	      unsigned char *src_end = GAP_END_ADDR;
 	      unsigned char *src = src_end - coding->src_bytes;
 
+#ifdef USE_NS_YIELD
+	      /* Pump NS run loop before potentially long in-place CR→LF scan.
+		 The loop modifies bytes atomically so it cannot be interrupted;
+		 pump once before it starts instead.  */
+	      maybe_quit ();
+#endif
 	      while (src < src_end)
 		{
 		  if (*src++ == '\r')
@@ -7986,6 +8025,12 @@ decode_coding_gap (struct coding_system *coding, ptrdiff_t bytes)
 	      unsigned char *dst = src;
 	      ptrdiff_t diff;
 
+#ifdef USE_NS_YIELD
+	      /* Pump NS run loop before potentially long CRLF→LF compaction.
+		 The loop does overlapping-copy compaction and cannot be
+		 interrupted mid-way; pump once before it starts.  */
+	      maybe_quit ();
+#endif
 	      while (src_beg < src)
 		{
 		  *--dst = *--src;

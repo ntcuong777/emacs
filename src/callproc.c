@@ -158,6 +158,72 @@ exec_path_cache_store (Lisp_Object program, Lisp_Object path)
 }
 #endif /* NTCUONG_CACHE_EXEC_PATH */
 
+#ifdef NTCUONG_EVENTLOOP_CALLPROC
+#ifdef HAVE_NS
+/* Pump the Cocoa run loop while waiting for a subprocess to exit.
+   Replaces wait_for_termination() for the call_process path only:
+   uses WNOHANG + ns_select so [NSApp run] keeps getting turns.
+   Must NOT be used from get_child_status (shared with sys_subshell)
+   to avoid pumping AppKit when a terminal subshell owns the tty.  */
+static bool
+ntcuong_wait_termination_ns (pid_t child, int *status, bool interruptible)
+{
+  while (true)
+    {
+      if (interruptible)
+	maybe_quit ();
+      pid_t p = waitpid (child, status, WNOHANG);
+      if (p > 0)
+	{
+	  if (input_available_clear_time)
+	    *input_available_clear_time = make_timespec (0, 0);
+	  return true;
+	}
+      if (p < 0 && errno != EINTR)
+	return false; /* hard error (ECHILD etc.) */
+      /* p == 0 (running) or EINTR: pump run loop then retry.
+	 50 ms = 20 Hz waitpid polling.  Subprocess exit detection
+	 latency 0–50 ms is imperceptible (direnv runs are typically
+	 hundreds of ms anyway), and AppKit gets uninterrupted run
+	 loop slices long enough to render workspace-switch animations
+	 smoothly instead of stepping in 20 ms bursts.
+	 FIXME: tune here if subprocess exit feels laggy (reduce) or
+	 if AppKit still stutters during direnv waitpid spin
+	 (increase, up to ~200 ms).  */
+      struct timespec t = make_timespec (0, 50000000); /* 50 ms */
+      ns_select (0, NULL, NULL, NULL, &t, NULL);
+    }
+}
+
+/* Helper for the NS-port event-loop pump in call_process.
+   Sets up read fd_set containing only fd and calls ns_select with a short
+   timeout.  ns_select pumps [NSApp run] so the Cocoa run loop stays alive
+   during blocking subprocess I/O without dispatching any Lisp (no timers,
+   no async-process filters).  */
+static void
+ntcuong_pump_ns_event_loop (int fd)
+{
+  fd_set rfds;
+  FD_ZERO (&rfds);
+  FD_SET (fd, &rfds);
+  /* 100 ms is the upper bound, not the typical wall slice: ns_select
+     returns immediately as soon as the subprocess writes (fd becomes
+     readable), so this adds zero latency for active output streams.
+     During silent stretches of a long direnv run, AppKit owns the run
+     loop for the full 100 ms — long enough to animate workspace
+     switches at 60–120 Hz without the 20 ms stair-step that the
+     previous timeout produced.
+     FIXME: this is the primary knob for envrc/direnv smoothness.
+     Raise to 250 ms if AppKit still feels choppy during silent waits;
+     lower to 50 ms if interactive subprocesses (M-! with prompts)
+     feel laggy.  fd-readable interruption means active output is
+     unaffected by this value.  */
+  struct timespec t = make_timespec (0, 100000000); /* 100 ms */
+  ns_select (fd + 1, &rfds, NULL, NULL, &t, NULL);
+}
+#endif /* HAVE_NS */
+#endif /* NTCUONG_EVENTLOOP_CALLPROC */
+
 /* The next two variables are used while record-unwind-protect is in place
    during call-process for a subprocess for which record_deleted_pid has
    not yet been called.  At other times, synch_process_pid is zero and
@@ -313,7 +379,11 @@ call_process_cleanup (Lisp_Object buffer)
       message1 ("Waiting for process to die...(type C-g again to kill it instantly)");
 
       /* This will quit on C-g.  */
+#if defined NTCUONG_EVENTLOOP_CALLPROC && defined HAVE_NS
+      bool wait_ok = ntcuong_wait_termination_ns (synch_process_pid, NULL, true);
+#else
       bool wait_ok = wait_for_termination (synch_process_pid, NULL, true);
+#endif
       synch_process_pid = 0;
       message1 (wait_ok
 		? "Waiting for process to die...done"
@@ -849,16 +919,62 @@ call_process (ptrdiff_t nargs, Lisp_Object *args, int filefd,
       ptrdiff_t prepared_pos = 0; /* prepare_to_modify_buffer was last
                                      called here.  */
 
+#ifdef NTCUONG_EVENTLOOP_CALLPROC
+#ifdef HAVE_NS
+      /* Switch fd0 to non-blocking so emacs_read_quit returns EAGAIN instead
+	 of blocking; we then call ntcuong_pump_ns_event_loop which runs
+	 [NSApp run] briefly without dispatching Lisp.  No fd registration
+	 with add_read_fd: ns_select watches fd0 directly in its own fd set,
+	 keeping the pump safe against the synch_process_pid recursion guard.  */
+      fcntl (fd0, F_SETFL, fcntl (fd0, F_GETFL, 0) | O_NONBLOCK);
+#endif /* HAVE_NS */
+#endif /* NTCUONG_EVENTLOOP_CALLPROC */
+
       while (1)
 	{
+#ifdef NTCUONG_EVENTLOOP_CALLPROC
+#ifdef HAVE_NS
+	  /* Yield Cocoa run loop at the top of every read batch.  This lets
+	     AppKit process accessibility and window-manager events (e.g.
+	     AeroSpace workspace switch) even for fast subprocesses where
+	     EAGAIN never fires.  ns_select returns immediately when fd0 is
+	     already readable, so no latency is added for quick commands.  */
+	  ntcuong_pump_ns_event_loop (fd0);
+#endif /* HAVE_NS */
+#endif /* NTCUONG_EVENTLOOP_CALLPROC */
 	  /* Repeatedly read until we've filled as much as possible
 	     of the buffer size we have.  But don't read
 	     less than 1024--save that for the next bufferful.  */
 	  nread = carryover;
 	  while (nread < bufsize - 1024)
 	    {
+#ifdef NTCUONG_EVENTLOOP_CALLPROC
+	      /* On EAGAIN pump only the Cocoa run loop (no Lisp), then retry.
+		 Avoids running timers/async-process filters via
+		 wait_reading_process_output, which could re-enter call-process
+		 while synch_process_pid is set.  On non-NS builds fd0 is still
+		 blocking so EAGAIN never occurs and the do-while is a no-op.  */
+	      int this_read;
+	      do
+		{
+		  this_read = emacs_read_quit (fd0, buf + nread,
+					       bufsize - nread);
+#ifdef HAVE_NS
+		  if (this_read < 0 && errno == EAGAIN)
+		    {
+		      ntcuong_pump_ns_event_loop (fd0);
+		      /* ns_select sets errno=EINTR on UI wakeup (nsterm.m:5368).
+			 Restore EAGAIN so the while condition retries the read
+			 rather than falling through to give_up.  */
+		      errno = EAGAIN;
+		    }
+#endif /* HAVE_NS */
+		}
+	      while (this_read < 0 && errno == EAGAIN);
+#else /* ! NTCUONG_EVENTLOOP_CALLPROC */
 	      int this_read = emacs_read_quit (fd0, buf + nread,
 					       bufsize - nread);
+#endif /* NTCUONG_EVENTLOOP_CALLPROC */
 
 	      if (this_read < 0)
 		goto give_up;
@@ -912,6 +1028,15 @@ call_process (ptrdiff_t nargs, Lisp_Object *args, int filefd,
             {
               insert_1_both (buf, nread, nread, 0, 0, 0);
               signal_after_change (PT - nread, 0, nread);
+#if defined NTCUONG_EVENTLOOP_CALLPROC && defined HAVE_NS
+	      /* Pump after font-lock: signal_after_change ran
+		 after-change-functions (including font-lock with inhibit-quit
+		 t), so the inhibit-quit window is now closed.  One explicit
+		 pump here covers the AeroSpace / revert-buffer blocking case
+		 without needing to remove the inhibit-quit guard from
+		 ns_pump_event_loop_briefly.  */
+	      ntcuong_pump_ns_event_loop (fd0);
+#endif
             }
 	  else
 	    {			/* We have to decode the input.  */
@@ -956,6 +1081,9 @@ call_process (ptrdiff_t nargs, Lisp_Object *args, int filefd,
 				PT_BYTE + process_coding.produced);
               signal_after_change (PT - process_coding.produced_char,
                                    0, process_coding.produced_char);
+#if defined NTCUONG_EVENTLOOP_CALLPROC && defined HAVE_NS
+	      ntcuong_pump_ns_event_loop (fd0);
+#endif
 	      carryover = process_coding.carryover_bytes;
 	      if (carryover > 0)
 		memcpy (buf, process_coding.carryover,
@@ -993,7 +1121,14 @@ call_process (ptrdiff_t nargs, Lisp_Object *args, int filefd,
   bool wait_ok = true;
 #ifndef MSDOS
   /* Wait for it to terminate, unless it already has.  */
+#if defined NTCUONG_EVENTLOOP_CALLPROC && defined HAVE_NS
+  /* Use a WNOHANG poll loop so the Cocoa run loop keeps getting turns
+     while waiting.  Confined here (not in get_child_status) to avoid
+     pumping AppKit during unrelated waits such as sys_subshell.  */
+  wait_ok = ntcuong_wait_termination_ns (pid, &status, fd0 < 0);
+#else
   wait_ok = wait_for_termination (pid, &status, fd0 < 0);
+#endif
 #endif
 
   /* Don't kill any children that the subprocess may have left behind

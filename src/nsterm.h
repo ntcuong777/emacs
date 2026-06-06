@@ -1249,6 +1249,9 @@ extern void ns_set_transparent_titlebar (struct frame *f,
 extern int ns_select (int nfds, fd_set *readfds, fd_set *writefds,
 		      fd_set *exceptfds, struct timespec *timeout,
 		      sigset_t *sigmask);
+#ifdef USE_NS_YIELD
+extern void ns_pump_event_loop_briefly (void);
+#endif
 #ifdef HAVE_PTHREAD
 extern void ns_run_loop_break (void);
 #endif

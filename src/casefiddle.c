@@ -1,4 +1,5 @@
 /* -*- coding: utf-8 -*- */
+
 /* GNU Emacs case conversion functions.
 
 Copyright (C) 1985, 1994, 1997-1999, 2001-2026 Free Software Foundation,
@@ -448,6 +449,9 @@ do_casify_unibyte_region (struct casing_context *ctx,
 
   for (ptrdiff_t pos = *startp; pos < end; ++pos)
     {
+#ifdef USE_NS_YIELD
+      rarely_quit (pos);
+#endif
       int ch = make_char_multibyte (FETCH_BYTE (pos));
       int cased = case_single_character (ctx, ch);
       if (cased == ch)
@@ -481,6 +485,9 @@ do_casify_multibyte_region (struct casing_context *ctx,
 
   for (; size; --size)
     {
+#ifdef USE_NS_YIELD
+      rarely_quit (pos);
+#endif
       int len, ch = string_char_and_length (BYTE_POS_ADDR (pos_byte), &len);
       struct casing_str_buf buf;
       if (!case_character (&buf, ctx, ch,

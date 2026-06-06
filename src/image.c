@@ -7010,6 +7010,9 @@ xpm_load_image (struct frame *f,
 #endif
   for (y = 0; y < height; y++)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       expect (XPM_TK_STRING);
       str = beg;
       if (len < width * chars_per_pixel)
@@ -8224,6 +8227,9 @@ pbm_load (struct frame *f, struct image *img)
       for (y = 0; y < height; ++y)
 	for (x = 0; x < width; ++x)
 	  {
+#ifdef USE_NS_YIELD
+	    maybe_quit ();
+#endif
 	    if (raw_p)
 	      {
 		if ((x & 7) == 0)
@@ -8280,6 +8286,9 @@ pbm_load (struct frame *f, struct image *img)
       for (y = 0; y < height; ++y)
 	for (x = 0; x < width; ++x)
 	  {
+#ifdef USE_NS_YIELD
+	    maybe_quit ();
+#endif
 	    int r, g, b;
 
 	    if (type == PBM_GRAY && raw_p)
@@ -9007,6 +9016,9 @@ png_load_body (struct frame *f, struct image *img, struct png_load_context *c)
 
   for (y = 0; y < height; ++y)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       png_byte *p = rows[y];
 
       for (x = 0; x < width; ++x)
@@ -9625,6 +9637,9 @@ jpeg_load_body (struct frame *f, struct image *img,
   /* Fill the X image from JPEG data.  */
   for (y = 0; y < height; ++y)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       jpeg_read_scanlines (&mgr->cinfo, buffer, 1);
       for (x = 0; x < width; ++x)
 	{
@@ -10069,6 +10084,9 @@ tiff_load (struct frame *f, struct image *img)
   /* Process the pixel raster.  Origin is in the lower-left corner.  */
   for (y = 0; y < height; ++y)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       UINT32 *row = buf + y * width;
 
       for (x = 0; x < width; ++x)
@@ -10747,8 +10765,16 @@ gif_load (struct frame *f, struct image *img)
   /* We now have the complete image (possibly composed from a series
      of animated frames) in pixmap.  Put it into ximg.  */
   for (y = 0; y < height; ++y)
+#ifndef USE_NS_YIELD
     for (x = 0; x < width; ++x)
       PUT_PIXEL (ximg, x, y, *(pixmap + x + y * width));
+#else
+    {
+      maybe_quit ();
+      for (x = 0; x < width; ++x)
+	PUT_PIXEL (ximg, x, y, *(pixmap + x + y * width));
+    }
+#endif
 
 #ifdef COLOR_TABLE_SUPPORT
   img->colors = colors_in_color_table (&img->ncolors);

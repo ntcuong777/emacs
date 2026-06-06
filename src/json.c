@@ -1362,6 +1362,9 @@ json_parse_array (struct json_parser *parser)
        */
       for (;;)
 	{
+#ifdef USE_NS_YIELD
+	  maybe_quit ();
+#endif
 	  Lisp_Object element = json_parse_value (parser, c);
 	  switch (parser->conf.array_type)
 	    {
@@ -1454,6 +1457,9 @@ json_parse_object (struct json_parser *parser)
        * the object workspace */
       for (;;)
 	{
+#ifdef USE_NS_YIELD
+	  maybe_quit ();
+#endif
 	  if (c != '"')
 	    json_signal_error (parser, Qjson_parse_error);
 

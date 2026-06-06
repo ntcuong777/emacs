@@ -149,6 +149,175 @@ nstrace_fullscreen_type_name (int fs_type)
 #endif
 
 
+#ifdef USE_NS_YIELD
+/* File-scoped flag so ns_yield_clear_pumping can reset it on nonlocal
+   exit via record_unwind_protect_void.  */
+static bool ns_yield_pumping;
+
+static void
+ns_yield_clear_pumping (void)
+{
+  ns_yield_pumping = false;
+}
+
+/* Pump the Cocoa run loop briefly (3 ms) so window-manager events
+   such as an AeroSpace workspace switch can be processed even while
+   Emacs is executing Lisp.  Called from maybe_quit (lisp.h) via a
+   forward C declaration — no circular include needed.
+
+   Uses ns_select_1(run_loop_only=YES) which skips the hold_event_q
+   flush to kbd_buffer.  This eliminates the keyboard-event
+   contamination risk that previously required guards against
+   inhibit-quit, inhibit_modification_hooks, and running_asynch_code.
+   AppKit events (AX queries, window management, animation frames)
+   are serviced normally; keyboard events arriving during the pump
+   are deferred via hold_event → pump_deferred_kbd and re-queued
+   after [NSApp run] returns.  Events that arrived before the pump
+   stay in hold_event_q for the next normal ns_select.
+
+   Guards:
+   - initialized + ns_term_init_done: disabled until NS display
+     setup is complete; [NSApp run] before then causes re-entrant
+     display init → startup hang.  Outside init, inhibit-quit
+     does NOT block pumping — font-lock's inhibit-quit binding
+     (the main blocking path for Magit/envrc/package-load) now
+     gets pumps via its own maybe_quit calls.
+   - redisplaying_p: redisplay is timing-sensitive; skip to avoid
+     premature abort.
+   - running_asynch_code: process filters/sentinels already served
+     by WRPO's outer ns_select; skip to avoid subtle interleaving.
+   - ns_yield_pumping: re-entrancy guard for nested pumps (AppKit
+     callbacks calling Lisp).
+   - 50 ms throttle: at most one pump per 50 ms.  20 Hz cadence
+     keeps AeroSpace workspace switch (5–10 AX calls) at 50–500 ms.
+
+   Counter gate in maybe_quit (lisp.h) reduces per-yield-site cost
+   to a single increment, mask, and branch.  One in 1024 maybe_quit
+   calls reaches this function.
+
+   Rate-limited to one pump per 50 ms.  Early return costs < 30 ns
+   (two timespec comparisons).  3 ms pump budget → 6 % overhead.
+
+   Throttle timing: last is updated AFTER ns_select returns so that a
+   nonlocal exit (quit/error) does not consume the 50 ms slot.
+
+   Unwind safety: record_unwind_protect_void + unbind_to ensure
+   ns_yield_pumping is cleared even if ns_select exits nonlocally.
+
+   block_input / unblock_input bracket [NSApp run] so keyboard/mouse
+   events queue in hold_event_q and are not dispatched to Lisp mid-call.
+   NSApp == nil falls back to thread_select during early startup.  */
+
+/* Set to true at the end of ns_term_init.  Pumping before display
+   infrastructure is fully wired causes [NSApp run] to re-enter
+   finishLaunching from inside Emacs's own init path → hang.  */
+static bool ns_term_init_done;
+
+/* Coarse counter for the inline gate in maybe_quit (lisp.h).  One in
+   1024 yield sites reaches the function; the 50 ms time throttle
+   below still applies.  */
+unsigned int ns_yield_counter;
+
+static void hold_event (struct input_event *);
+static int ns_select_1 (int, fd_set *, fd_set *, fd_set *,
+			 struct timespec *, sigset_t *, BOOL);
+
+/* Keyboard events deferred during a yield pump (see hold_event).
+   Replayed into hold_event_q after the pump so command-loop ordering
+   is preserved and SIGIO is not raised mid-hook.  */
+#define PUMP_DEFERRED_KBD_MAX 64
+static struct input_event pump_deferred_kbd[PUMP_DEFERRED_KBD_MAX];
+static int pump_deferred_kbd_nr;
+
+void
+ns_pump_event_loop_briefly (void)
+{
+  /* Stay completely out of the way until pdumper load + Lisp init
+     are done.  maybe_quit fires from inside the dump-load path and
+     from native-comp lazy bootstrap; [NSApp run] in those windows
+     produces the emacs -Q startup hang.  */
+  if (!initialized)
+    return;
+
+  /* Likewise: ns_term_init creates NSApp via sharedApplication well
+     before finishing display setup.  Pumping in that window lets
+     [NSApp run] auto-invoke finishLaunching mid-init.  */
+  if (!ns_term_init_done)
+    return;
+
+  /* inhibit-quit guard.  run_loop_only=YES stops keyboard events from
+     reaching kbd_buffer, but [NSApp run] still SYNCHRONOUSLY dispatches
+     non-keyboard events (mouseDown:, drawRect:, AX queries, timers) to
+     views and into Lisp.  Code that binds (inhibit-quit t) — font-lock-
+     after-change, and many other critical sections — is explicitly
+     non-reentrant; dispatching a mouseDown: command or a redisplay there
+     re-enters Lisp/frame teardown with inconsistent state and crashes
+     (observed: null dpyinfo deref at 0x0 on a tab-bar click).  The
+     keyboard-deferral mechanism does NOT make those sections reentrant,
+     so the guard is required, not optional.  The envrc/call-process case
+     is covered separately by the bounded pump in callproc.c, which fires
+     AFTER signal_after_change returns — outside the inhibit-quit window.  */
+  if (!NILP (Vinhibit_quit))
+    return;
+
+  /* Skip during redisplay: pump → unblock_input → hold_event_q flush →
+     kbd_buffer non-empty → redisplay aborts early → stutter on cursor movement.
+     The run_loop_only ns_select skips the hold_event_q flush, but redisplay
+     is timing-sensitive and pumps are safer skipped here.  */
+  if (redisplaying_p)
+    return;
+
+  /* Process filters and sentinels already get run-loop time from
+     wait_reading_process_output's outer ns_select.  A second pump
+     during async-code execution risks subtle interleaving with
+     WRPO's input detection.  run_loop_only ns_select skips the
+     hold_event_q flush, but the WRPO pump cadence is already
+     sufficient for async-code responsiveness.  */
+  if (running_asynch_code)
+    return;
+
+  /* Skip during after-change-functions.  signal_after_change sets
+     inhibit_modification_hooks before invoking the hooks, so a slow
+     custom after-change callback cannot have [NSApp run] re-enter and
+     mutate the same buffer mid-hook.  Restored alongside the
+     Vinhibit_quit guard for the same reentrancy reason.  */
+  if (inhibit_modification_hooks)
+    return;
+
+  if (ns_yield_pumping)
+    return;
+
+  static struct timespec last;
+  struct timespec now = current_timespec ();
+  struct timespec elapsed = timespec_sub (now, last);
+  if (elapsed.tv_sec == 0 && elapsed.tv_nsec < 50000000)
+    return;
+
+  specpdl_ref count = SPECPDL_INDEX ();
+  ns_yield_pumping = true;
+  record_unwind_protect_void (ns_yield_clear_pumping);
+  /* 3 ms budget: ns_select_1 with run_loop_only=YES skips the
+     hold_event_q flush so keyboard events stay queued.  AppKit
+     AX calls (AeroSpace workspace switch) are serviced normally.
+     Keyboard events arriving during the pump are deferred via
+     hold_event → pump_deferred_kbd and re-queued below.  */
+  struct timespec t = make_timespec (0, 3000000);
+  ns_select_1 (0, NULL, NULL, NULL, &t, NULL, YES);
+  /* Re-queue keyboard events deferred during the pump.  Clear
+     ns_yield_pumping first so hold_event treats them normally;
+     unbind_to below calls ns_yield_clear_pumping (now a no-op).  */
+  ns_yield_pumping = false;
+  for (int i = 0; i < pump_deferred_kbd_nr; i++)
+    hold_event (&pump_deferred_kbd[i]);
+  pump_deferred_kbd_nr = 0;
+  /* Update last AFTER the pump so an aborted slice does not consume
+     the 50 ms rate-limit window.  */
+  last = current_timespec ();
+  unbind_to (count, Qnil);
+}
+#endif /* USE_NS_YIELD */
+
+
 /* ==========================================================================
 
    NSColor, EmacsColor category.
@@ -497,6 +666,25 @@ ns_finish_events (void)
 static void
 hold_event (struct input_event *event)
 {
+#ifdef USE_NS_YIELD
+  /* During a yield pump, defer keyboard events instead of queuing them
+     in hold_event_q.  Raising SIGIO for a keyboard event mid-hook
+     (e.g. corfu post-command) contaminates kbd_buffer before the hook
+     finishes, which can cause duplicate char insertion ("lolo" bug).
+     Events are re-queued after the pump — no keystrokes are lost.  */
+  if (ns_yield_pumping)
+    {
+      enum event_kind k = event->kind;
+      if (k == ASCII_KEYSTROKE_EVENT
+          || k == MULTIBYTE_CHAR_KEYSTROKE_EVENT
+          || k == NON_ASCII_KEYSTROKE_EVENT)
+        {
+          if (pump_deferred_kbd_nr < PUMP_DEFERRED_KBD_MAX)
+            pump_deferred_kbd[pump_deferred_kbd_nr++] = *event;
+          return;
+        }
+    }
+#endif
   if (hold_event_q.nr == hold_event_q.cap)
     {
       if (hold_event_q.cap == 0) hold_event_q.cap = 10;
@@ -5267,11 +5455,23 @@ ns_select_1 (int nfds, fd_set *readfds, fd_set *writefds,
   check_native_fs ();
 #endif
 
+#ifdef USE_NS_YIELD
+  /* When called from a yield pump (run_loop_only), do NOT flush
+     hold_event_q into kbd_buffer.  The pump only needs to service
+     AppKit events (accessibility, window management); flushing
+     keyboard events would contaminate kbd_buffer mid-hook and
+     cause duplicate char insertion (corfu), premature redisplay
+     abort (cursor stutter), and hook re-entrancy.  Events queued
+     in hold_event_q will be flushed on the next normal ns_select
+     (or ns_read_socket) call.  */
+  if (!run_loop_only && hold_event_q.nr > 0)
+#else /* !USE_NS_YIELD */
   /* If there are input events pending, store them so that Emacs can
      recognize C-g.  (And we must make sure [NSApp run] is called in
      this function, so that C-g has a chance to land in
      hold_event_q.)  */
   if (hold_event_q.nr > 0)
+#endif
     {
       for (int i = 0; i < hold_event_q.nr; ++i)
         kbd_buffer_store_event_hold (&hold_event_q.q[i], NULL);
@@ -6243,6 +6443,12 @@ ns_term_init (Lisp_Object display_name)
   NSTRACE_MSG ("ns_term_init done");
 
   unblock_input ();
+
+#ifdef USE_NS_YIELD
+  /* Display infra fully wired — safe to let maybe_quit pump the NS
+     run loop now.  See ns_pump_event_loop_briefly.  */
+  ns_term_init_done = true;
+#endif
 
   return dpyinfo;
 }

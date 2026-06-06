@@ -5321,6 +5321,13 @@ load_comp_unit (struct Lisp_Native_Comp_Unit *comp_u, bool loading_dump,
       EMACS_INT d_vec_len = XFIXNUM (Flength (comp_u->data_vec));
       for (EMACS_INT i = 0; i < d_vec_len; i++)
 	data_relocs[i] = AREF (comp_u->data_vec, i);
+
+#if defined USE_NS_YIELD && defined HAVE_NS
+      /* Data relocation loop has no maybe_quit calls; pump AppKit so
+	 the window manager (AeroSpace) stays responsive during load.  */
+      extern void ns_pump_event_loop_briefly (void);
+      ns_pump_event_loop_briefly ();
+#endif
     }
 
   if (!loading_dump)
@@ -5350,6 +5357,14 @@ load_comp_unit (struct Lisp_Native_Comp_Unit *comp_u, bool loading_dump,
 	}
       /* Executing this will perform all the expected environment
 	 modifications.  */
+#if defined USE_NS_YIELD && defined HAVE_NS
+      /* top_level_run runs all top-level Lisp forms in the eln; on
+	 large files this takes 1-3 s with no maybe_quit calls.  Pump
+	 once before entry so the window manager can service pending
+	 Accessibility API requests before we block.  */
+      extern void ns_pump_event_loop_briefly (void);
+      ns_pump_event_loop_briefly ();
+#endif
       res = top_level_run (comp_u_lisp_obj);
       /* Make sure data_ephemeral_vec still exists after top_level_run has run.
 	 Guard against sibling call optimization (or any other).  */

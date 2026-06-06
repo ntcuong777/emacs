@@ -547,6 +547,9 @@ skip_dyn_bytes (source_t *source, ptrdiff_t n)
       int c;
       do {
 	c = readchar (source);
+#ifdef USE_NS_YIELD
+	maybe_quit ();
+#endif
       } while (c >= 0 && c != '\037');
     }
 }
@@ -562,7 +565,14 @@ skip_dyn_eof (source_t *source)
       infile->lookahead = 0;
     }
   else
+#ifndef USE_NS_YIELD
     while (readchar (source) >= 0);
+#else
+    {
+      while (readchar (source) >= 0)
+	maybe_quit ();
+    }
+#endif
 }
 
 /* Read a byte from the current input file.  Return -1 at end of file.  */
@@ -1535,6 +1545,16 @@ Return t if the file exists and loads successfully.  */)
     }
   unbind_to (count, Qnil);
 
+#ifdef USE_NS_YIELD
+  /* Pump NS run loop after a file has finished loading.  When loading
+     a package with many dependencies (require chain), each Fload call
+     evaluates potentially hundreds of top-level forms without a yield.
+     This pump gives the window manager a turn before eval-after-load
+     forms (which may trigger more require/load calls) and between
+     sequential loads in the require chain.  */
+  ns_pump_event_loop_briefly ();
+#endif
+
   /* Run any eval-after-load forms for this file.  */
   if (!NILP (Ffboundp (Qdo_after_load_evaluation)))
     calln (Qdo_after_load_evaluation, hist_file_name);
@@ -2330,6 +2350,17 @@ readevalloop (Lisp_Object readcharfun,
 
       /* Restore saved point and BEGV.  */
       unbind_to (count1, Qnil);
+
+#ifdef USE_NS_YIELD
+      /* Pump NS run loop between expression evaluations during load.
+	 When loading a package with many top-level forms (e.g. after
+	 Nix build), the eval step can take hundreds of ms per form.
+	 Counter pre-filter (1 in 256) avoids wasted clock_gettime
+	 syscalls when the 50 ms throttle would block the pump anyway.
+	 For a 5000-form load (org-mode), ~20 actual pump attempts.  */
+      if ((++ns_yield_counter & 0xFF) == 0)
+	ns_pump_event_loop_briefly ();
+#endif
 
       /* Now eval what we just read.  */
       if (!NILP (macroexpand))
@@ -4264,6 +4295,7 @@ read0 (source_t *source, bool locate_syms)
      do with it.  */
   while (rdstack.sp > base_sp)
     {
+      maybe_quit ();
       struct read_stack_entry *e = read_stack_top ();
       switch (e->type)
 	{

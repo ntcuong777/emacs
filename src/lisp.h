@@ -3893,9 +3893,28 @@ extern void probably_quit (void);
 
    When not quitting, process any pending signals.  */
 
+/* Forward declaration for USE_NS_YIELD: pump the Cocoa run loop from
+   maybe_quit without including nsterm.h (frame.h → lisp.h circular
+   dependency).  Resolved at link time; dead-stripped on non-NS builds.  */
+#if defined USE_NS_YIELD && defined HAVE_NS
+extern void ns_pump_event_loop_briefly (void);
+extern unsigned int ns_yield_counter;
+#endif
+
 INLINE void
 maybe_quit (void)
 {
+#if defined USE_NS_YIELD && defined HAVE_NS
+  /* Coarse pre-filter: only one in 1024 yield sites reaches the pump
+     function.  Avoids a cross-TU call (and its argument-setup cost)
+     on every maybe_quit in hot Lisp loops, GC mark batches, and
+     native-comp bootstrap.  The 50 ms time throttle inside
+     ns_pump_event_loop_briefly still applies; any non-trivial loop
+     crosses 1024 maybe_quits well under 50 ms, so the 20 Hz pump
+     cadence is preserved.  */
+  if ((++ns_yield_counter & 0x3FF) == 0)
+    ns_pump_event_loop_briefly ();
+#endif
   if (!NILP (Vquit_flag) || pending_signals)
     probably_quit ();
 }

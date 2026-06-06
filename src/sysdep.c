@@ -140,6 +140,12 @@ int _cdecl _spawnlp (int, const char *, const char *, ...);
 #include "sfntfont.h"
 #endif
 
+#ifdef NTCUONG_EVENTLOOP_CALLPROC
+#ifdef HAVE_NS
+#include "nsterm.h"
+#endif
+#endif
+
 /* Declare here, including term.h is problematic on some systems.  */
 extern void tputs (const char *, int, int (*)(int));
 
@@ -748,7 +754,29 @@ sys_subshell (void)
 #endif
 
 #ifndef DOS_NT
+#if defined NTCUONG_EVENTLOOP_CALLPROC && defined HAVE_NS
+  /* Poll with WNOHANG + NS run-loop pump so AppKit keeps servicing
+     accessibility and UI events while the subshell runs.
+     Non-interruptible (no maybe_quit), same semantics as the
+     original wait_for_termination call.  Gated here rather than in
+     get_child_status so only this specific wait gets the pump.  */
+  for (;;)
+    {
+      pid_t p = waitpid (pid, &status, WNOHANG);
+      if (p > 0)
+        {
+          if (input_available_clear_time)
+            *input_available_clear_time = make_timespec (0, 0);
+          break;
+        }
+      if (p < 0 && errno != EINTR)
+        break; /* hard error such as ECHILD */
+      struct timespec t = make_timespec (0, 20000000); /* 20 ms */
+      ns_select (0, NULL, NULL, NULL, &t, NULL);
+    }
+#else
   wait_for_termination (pid, &status, 0);
+#endif
 #endif
   restore_signal_handlers (saved_handlers);
 }

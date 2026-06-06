@@ -4241,6 +4241,9 @@ base64_encode_1 (const char *from, char *to, ptrdiff_t length,
 
   while (i < length)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       if (multibyte)
 	{
 	  c = string_char_and_length ((unsigned char *) from + i, &bytes);
@@ -4462,6 +4465,9 @@ base64_decode_1 (const char *from, char *to, ptrdiff_t length,
 
   while (true)
     {
+#ifdef USE_NS_YIELD
+      maybe_quit ();
+#endif
       unsigned char c;
       int v1;
 

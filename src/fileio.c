@@ -5111,6 +5111,11 @@ by calling `format-decode', which see.  */)
          but `decode_coding_gap` can't have them at the beginning of the gap,
          so we need to move them.  */
       memmove (GAP_END_ADDR - inserted, GPT_ADDR, inserted);
+#ifdef USE_NS_YIELD
+      /* Pump the NS run loop once before decode: coding.c has no quit
+         points, so for large files this is the only pump opportunity.  */
+      maybe_quit ();
+#endif
       decode_coding_gap (&coding, inserted);
       inserted = coding.produced_char;
       coding_system = CODING_ID_NAME (coding.id);
