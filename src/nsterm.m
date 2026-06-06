@@ -8042,6 +8042,17 @@ ns_in_echo_area (void)
 /* This is what happens when the user presses a mouse button.  */
 - (void)mouseDown: (NSEvent *)theEvent
 {
+#if defined NTCUONG_NS_MOUSEDOWN_DPYINFO_GUARD \
+  || (defined NS_IMPL_COCOA && MAC_OS_X_VERSION_MAX_ALLOWED >= 260000)
+  /* macOS 26 can deliver mouseDown: after frame output data is freed.
+     output_data.ns is NULL after frame teardown → FRAME_DISPLAY_INFO
+     would dereference 0x0 + offsetof(display_info).  Guard MUST run
+     before FRAME_DISPLAY_INFO; a post-assignment !dpyinfo check is
+     unreachable because the crash happens at the macro expansion.  */
+  if (!FRAME_OUTPUT_DATA (emacsframe))
+    return;
+#endif
+
   struct ns_display_info *dpyinfo = FRAME_DISPLAY_INFO (emacsframe);
   NSPoint p = [self convertPoint: [theEvent locationInWindow] fromView: nil];
   EmacsWindow *window;
@@ -8267,9 +8278,19 @@ ns_in_echo_area (void)
                              | EV_UDMODIFIERS (theEvent);
 
       if (emacs_event->modifiers & down_modifier)
+#if !defined NTCUONG_NS_MOUSEDOWN_DPYINFO_GUARD \
+  && !(defined NS_IMPL_COCOA && MAC_OS_X_VERSION_MAX_ALLOWED >= 260000)
 	FRAME_DISPLAY_INFO (emacsframe)->grabbed |= 1 << EV_BUTTON (theEvent);
+#else /* NTCUONG_NS_MOUSEDOWN_DPYINFO_GUARD */
+	dpyinfo->grabbed |= 1 << EV_BUTTON (theEvent);
+#endif
       else
+#if !defined NTCUONG_NS_MOUSEDOWN_DPYINFO_GUARD \
+  && !(defined NS_IMPL_COCOA && MAC_OS_X_VERSION_MAX_ALLOWED >= 260000)
 	FRAME_DISPLAY_INFO (emacsframe)->grabbed &= ~(1 << EV_BUTTON (theEvent));
+#else /* NTCUONG_NS_MOUSEDOWN_DPYINFO_GUARD */
+	dpyinfo->grabbed &= ~(1 << EV_BUTTON (theEvent));
+#endif
     }
 
   XSETINT (emacs_event->x, lrint (p.x));
