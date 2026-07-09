@@ -296,13 +296,26 @@ ns_pump_event_loop_briefly (void)
   specpdl_ref count = SPECPDL_INDEX ();
   ns_yield_pumping = true;
   record_unwind_protect_void (ns_yield_clear_pumping);
-  /* 3 ms budget: ns_select_1 with run_loop_only=YES skips the
-     hold_event_q flush so keyboard events stay queued.  AppKit
-     AX calls (AeroSpace workspace switch) are serviced normally.
-     Keyboard events arriving during the pump are deferred via
-     hold_event → pump_deferred_kbd and re-queued below.  */
-  struct timespec t = make_timespec (0, 3000000);
-  ns_select_1 (0, NULL, NULL, NULL, &t, NULL, YES);
+  /* Drain AppKit events to completion so a workspace switch (5-10 AX
+     round-trips) completes atomically in one pump instead of straddling
+     the next 50 ms-throttled pump (the cause of AeroSpace jitter).
+     Re-enter ns_select_1(run_loop_only=YES) with a 3 ms sub-timeout
+     until a pass times out with nothing ready (result == 0 = queue
+     momentarily empty) or a 12 ms hard cap elapses.  run_loop_only=YES
+     preserves the hold_event_q / pump_deferred_kbd keyboard-deferral
+     safety.  */
+  struct timespec cap = make_timespec (0, 12000000); /* 12 ms */
+  struct timespec start = current_timespec ();
+  for (;;)
+    {
+      struct timespec t = make_timespec (0, 3000000); /* 3 ms */
+      int r = ns_select_1 (0, NULL, NULL, NULL, &t, NULL, YES);
+      if (r == 0)
+	break; /* timeout: AppKit queue momentarily empty */
+      struct timespec elapsed = timespec_sub (current_timespec (), start);
+      if (timespec_cmp (elapsed, cap) >= 0)
+	break; /* hard cap */
+    }
   /* Re-queue keyboard events deferred during the pump.  Clear
      ns_yield_pumping first so hold_event treats them normally;
      unbind_to below calls ns_yield_clear_pumping (now a no-op).  */
@@ -310,6 +323,9 @@ ns_pump_event_loop_briefly (void)
   for (int i = 0; i < pump_deferred_kbd_nr; i++)
     hold_event (&pump_deferred_kbd[i]);
   pump_deferred_kbd_nr = 0;
+  /* Reset yield counter so it can't overflow across a long session,
+     and so the per-site cadence stays consistent after each pump.  */
+  ns_yield_counter = 0;
   /* Update last AFTER the pump so an aborted slice does not consume
      the 50 ms rate-limit window.  */
   last = current_timespec ();

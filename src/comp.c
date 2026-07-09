@@ -5517,6 +5517,19 @@ This gets called by top_level_run during the load phase.  */)
   return tem;
 }
 
+DEFUN ("comp--maybe-yield", Fcomp__maybe_yield, Scomp__maybe_yield,
+       0, 0, 0,
+       doc: /* Pump the NS run loop.  Called from generated top_level_run
+every N top-level forms so a heavy .eln does not block AppKit.  */)
+  (void)
+{
+#if defined USE_NS_YIELD && defined HAVE_NS
+  extern void ns_pump_event_loop_briefly (void);
+  ns_pump_event_loop_briefly ();
+#endif
+  return Qnil;
+}
+
 DEFUN ("comp--late-register-subr", Fcomp__late_register_subr,
        Scomp__late_register_subr, 7, 7, 0,
        doc: /* Register exported subr.
@@ -5746,6 +5759,7 @@ natively compiled one.  */);
   defsubr (&Scomp__register_lambda);
   defsubr (&Scomp__register_subr);
   defsubr (&Scomp__late_register_subr);
+  defsubr (&Scomp__maybe_yield);
   defsubr (&Snative_elisp_load);
 
   staticpro (&comp.exported_funcs_h);

@@ -1693,8 +1693,17 @@ into the C code forwarding the compilation unit."
     (maphash (lambda (_ func)
                (comp--emit-lambda-for-top-level func))
              (comp-ctxt-byte-func-to-func-h comp-ctxt))
-    (mapc (lambda (x) (comp--emit-for-top-level x for-late-load))
-          (comp-ctxt-top-level-forms comp-ctxt))
+    (let ((form-count 0))
+      (mapc (lambda (x)
+              (comp--emit-for-top-level x for-late-load)
+              (setq form-count (1+ form-count))
+              (when (zerop (logand form-count 255))
+                ;; Pump the NS run loop every 256 top-level forms so a
+                ;; heavy .eln (org, magit) does not block AeroSpace.
+                ;; comp--maybe-yield is a no-op DEFUN on non-NS builds.
+                (comp--emit (comp--call 'comp--maybe-yield))
+                (setq form-count 0)))
+            (comp-ctxt-top-level-forms comp-ctxt)))
     (comp--emit `(return ,(make--comp-mvar :slot 1)))
     (comp--limplify-finalize-function func)))
 

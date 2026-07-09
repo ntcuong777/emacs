@@ -1720,6 +1720,10 @@ maybe_swap_for_eln (bool no_native, Lisp_Object *filename, int *fd,
   Lisp_Object dir = Qnil;
   FOR_EACH_TAIL_SAFE (eln_path_tail)
     {
+#if defined USE_NS_YIELD && defined HAVE_NS
+      if ((++ns_yield_counter & 0xFF) == 0)
+	ns_pump_event_loop_briefly ();
+#endif
       dir = XCAR (eln_path_tail);
       Lisp_Object eln_name =
 	Fexpand_file_name (eln_rel_name,
@@ -1821,6 +1825,16 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
      executable. */
   FOR_EACH_TAIL_SAFE (path)
    {
+#if defined USE_NS_YIELD && defined HAVE_NS
+      /* openp does one blocking stat/open/faccessat syscall per
+	 (load-path dir × suffix) on a cold nix-store cache; the loop
+	 is FOR_EACH_TAIL_SAFE (check_quit=false) so maybe_quit never
+	 fires.  Pump AppKit every 256 path elements so AeroSpace
+	 workspace switches stay serviced.  The 50 ms throttle inside
+	 ns_pump_event_loop_briefly makes throttled calls cost <30 ns.  */
+      if ((++ns_yield_counter & 0xFF) == 0)
+	ns_pump_event_loop_briefly ();
+#endif
     ptrdiff_t baselen, prefixlen;
 
     if (EQ (path, just_use_str))
@@ -1860,6 +1874,10 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
     tail = NILP (suffixes) ? empty_string_only : suffixes;
     FOR_EACH_TAIL_SAFE (tail)
       {
+#if defined USE_NS_YIELD && defined HAVE_NS
+      if ((++ns_yield_counter & 0xFF) == 0)
+	ns_pump_event_loop_briefly ();
+#endif
 	Lisp_Object suffix = XCAR (tail);
 	ptrdiff_t fnlen, lsuffix = SBYTES (suffix);
 	Lisp_Object handler;
