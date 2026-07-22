@@ -89,6 +89,8 @@ enum { FSEVENTS_SIBLING_PROMOTION_THRESHOLD = 8 };
 #define PENDING_FILE(p)      (XCAR (XCDR (p)))
 #define PENDING_ACTION(p)    (XCAR (XCDR (XCDR (p))))
 #define PENDING_BATCH_IDX(p) XFIXNUM (XCAR (XCDR (XCDR (XCDR (p)))))
+#define PENDING_ACTIVE(p)       (XCAR (XCDR (XCDR (XCDR (XCDR (p))))))
+#define PENDING_SET_INACTIVE(p) XSETCAR (XCDR (XCDR (XCDR (XCDR (p)))), Qnil)
 
 void globals_of_fsevents (void);
 void syms_of_fsevents (void);
@@ -147,6 +149,42 @@ static void raw_queue_push_without_wake (struct raw_batch *batch);
 
 static bool fsevents_debug_inject_batch_during_read;
 static int fsevents_debug_inject_stream_id;
+
+/* Performance instrumentation, disabled by default so production hot
+   paths pay only a predictable false branch.  The enable flag and
+   LSTAT_CALLS are read/written from the GCD callback thread as well
+   as the main thread, so they use atomic builtins (matching
+   src/android.c's use of __atomic_* on plain scalar globals).  The
+   other three counters are only ever touched on the main thread.  */
+static bool fsevents_debug_performance_counters_enabled;
+static uintmax_t fsevents_debug_batch_prepares;
+static uintmax_t fsevents_debug_watch_dispatches;
+static uintmax_t fsevents_debug_pending_probes;
+static uintmax_t fsevents_debug_lstat_calls;
+
+static void
+fsevents_debug_count_batch_prepare (void)
+{
+  if (__atomic_load_n (&fsevents_debug_performance_counters_enabled,
+                       __ATOMIC_ACQUIRE))
+    fsevents_debug_batch_prepares++;
+}
+
+static void
+fsevents_debug_count_watch_dispatch (void)
+{
+  if (__atomic_load_n (&fsevents_debug_performance_counters_enabled,
+                       __ATOMIC_ACQUIRE))
+    fsevents_debug_watch_dispatches++;
+}
+
+static void
+fsevents_debug_count_pending_probe (void)
+{
+  if (__atomic_load_n (&fsevents_debug_performance_counters_enabled,
+                       __ATOMIC_ACQUIRE))
+    fsevents_debug_pending_probes++;
+}
 
 static struct raw_batch *
 raw_batch_make_empty (int stream_id)
@@ -341,17 +379,6 @@ fsevents_translate_path (Lisp_Object event_path,
     return Fdirectory_file_name (orig_dir);
 
   return event_path;
-}
-
-/* Decode a raw path and translate it from the physical namespace to
-   the caller's namespace.  */
-static Lisp_Object
-fsevents_decode_and_translate (const char *raw_path,
-			       Lisp_Object resolved_dir,
-			       Lisp_Object orig_dir)
-{
-  Lisp_Object file = DECODE_FILE (build_unibyte_string (raw_path));
-  return fsevents_translate_path (file, resolved_dir, orig_dir);
 }
 
 
@@ -741,6 +768,20 @@ fsevents_same_path_p (Lisp_Object file1, Lisp_Object file2)
   return len1 == len2 && memcmp (str1, str2, len1) == 0;
 }
 
+/* Return FILE's normalized key for the O(1) pending-rename lookup
+   table: FILE unchanged, except a single trailing slash is stripped
+   (mirroring fsevents_same_path_p's one-trailing-slash equivalence).
+   PATH must be a translated Lisp string, never a raw callback
+   spelling.  */
+static Lisp_Object
+fsevents_same_path_key (Lisp_Object path)
+{
+  ptrdiff_t len = SBYTES (path);
+  if (len > 1 && SDATA (path)[len - 1] == '/')
+    return Fsubstring (path, make_fixnum (0), make_fixnum (SCHARS (path) - 1));
+  return path;
+}
+
 /* Return true if the rename from OLD_FILE to NEW_FILE stays inside the
    watched scope of DESCRIPTOR.  Cross-boundary renames must remain
    one-sided so the read callback can resolve them to create/delete.  */
@@ -842,75 +883,17 @@ fsevents_one_sided_rename_action (bool path_exists)
 
 /* Return a pending rename entry for DESCRIPTOR, FILE, and BATCH_IDX
    (the index of this event within the current callback batch).
-   PATH_EXISTS is the lstat snapshot captured at callback time.  */
+   PATH_EXISTS is the lstat snapshot captured at callback time.  The
+   entry starts ACTIVE (t); resolving or pairing it later flips
+   ACTIVE to nil in place rather than unlinking it from the
+   chronological pending list.  */
 static Lisp_Object
 fsevents_make_pending_rename (int descriptor, Lisp_Object file,
 			      size_t batch_idx, bool path_exists)
 {
-  return list4 (make_fixnum (descriptor), file,
+  return list5 (make_fixnum (descriptor), file,
 		fsevents_one_sided_rename_action (path_exists),
-		make_fixnum (batch_idx));
-}
-
-/* Return true if FILE appears in any later batch entry at index
-   START or beyond.  Used to avoid synthesizing events that a real
-   later entry will cover.  RESOLVED_DIR and ORIG_DIR are used to
-   translate raw physical paths to the caller's namespace.  */
-static bool
-fsevents_later_event_on_path_p (Lisp_Object file, struct raw_event *events,
-				size_t start, size_t num_events,
-				Lisp_Object resolved_dir,
-				Lisp_Object orig_dir)
-{
-  for (size_t i = start; i < num_events; i++)
-    {
-      Lisp_Object later_file
-	= fsevents_decode_and_translate (events[i].path,
-					 resolved_dir, orig_dir);
-      if (fsevents_same_path_p (file, later_file))
-	return true;
-    }
-  return false;
-}
-
-/* Return true if FILE is the source of a NEW rename pair whose
-   destination is the immediately next batch entry (at START).
-
-   A rename destination that still exists on disk is just the end of
-   the current pair, not the start of a chain.  This distinguishes two
-   independent pairs (a->b, c->d -- b exists) from a genuine rename
-   chain (a->b, b->c -- b does not exist because it was renamed away).
-   FSEvents guarantees rename pairs are consecutive, so only
-   events[START] is checked as the potential pair partner.  */
-static bool
-fsevents_rename_starts_new_pair_p (int descriptor, Lisp_Object file,
-				   bool path_exists,
-				   struct raw_event *events,
-				   size_t start, size_t num_events,
-				   Lisp_Object resolved_dir,
-				   Lisp_Object orig_dir)
-{
-  /* A file that exists on disk is a rename destination, not the
-     source of a further rename.  Uses the lstat snapshot captured
-     at callback time, not the current filesystem state.  */
-  if (path_exists)
-    return false;
-
-  if (start < num_events
-      && (events[start].flags & kFSEventStreamEventFlagItemRenamed))
-    {
-      Lisp_Object later_file
-	= fsevents_decode_and_translate (events[start].path,
-					 resolved_dir, orig_dir);
-
-      if (fsevents_rename_pair_relevant_p (descriptor, file, later_file)
-	  || !NILP (fsevents_cross_boundary_rename_entry (descriptor,
-							  file,
-							  later_file)))
-	return true;
-    }
-
-  return false;
+		make_fixnum (batch_idx), Qt);
 }
 
 /* Return the low-level action list corresponding to FLAGS.  Set
@@ -981,22 +964,119 @@ fsevents_resolve_pending_rename (Lisp_Object pending, Lisp_Object current_file,
   return list3 (make_fixnum (descriptor), list1 (action), file);
 }
 
-/* Flush all pending renames, using CURRENT_FILE/CURRENT_ACTIONS when the
-   later batch entry reuses the same pathname.  */
+/* Append ENTRY (an active pending-rename record) to the chronological
+   pending list in O(1): *PENDING_TAIL always names the last cons of
+   *PENDING_HEAD, so extending it is a single XSETCDR.  Also index
+   ENTRY under its normalized path in *PENDING_BY_PATH (lazily
+   created), prepending to that path's bucket in O(1); buckets are
+   read back in reverse-chronological order, so callers must
+   Fnreverse before emitting.  *LAST_PENDING tracks only the most
+   recently appended entry, the sole candidate for the
+   consecutive-index rename-pair check (FSEvents guarantees rename
+   pairs are consecutive batch entries).  */
 static void
-fsevents_flush_pending_rename (Lisp_Object *pending_rename,
-                               Lisp_Object *batch,
-                               Lisp_Object current_file,
-                               Lisp_Object current_actions,
-                               Lisp_Object current_default_action)
+fsevents_pending_append (Lisp_Object *pending_head, Lisp_Object *pending_tail,
+			 Lisp_Object *last_pending,
+			 Lisp_Object *pending_by_path, Lisp_Object entry)
 {
-  for (Lisp_Object tail = *pending_rename; CONSP (tail); tail = XCDR (tail))
-    *batch = Fcons (fsevents_resolve_pending_rename (XCAR (tail),
-						     current_file,
-						     current_actions,
-						     current_default_action),
-		    *batch);
-  *pending_rename = Qnil;
+  Lisp_Object link = Fcons (entry, Qnil);
+  if (NILP (*pending_head))
+    *pending_head = link;
+  else
+    XSETCDR (*pending_tail, link);
+  *pending_tail = link;
+  *last_pending = entry;
+
+  if (NILP (*pending_by_path))
+    *pending_by_path = make_hash_table (&hashtest_equal, DEFAULT_HASH_SIZE,
+					Weak_None);
+
+  struct Lisp_Hash_Table *h = XHASH_TABLE (*pending_by_path);
+  Lisp_Object key = fsevents_same_path_key (PENDING_FILE (entry));
+  hash_hash_t hash;
+  ptrdiff_t idx = hash_find_get_hash (h, key, &hash);
+  if (idx >= 0)
+    set_hash_value_slot (h, idx, Fcons (entry, HASH_VALUE (h, idx)));
+  else
+    hash_put (h, key, Fcons (entry, Qnil), hash);
+}
+
+/* Resolve and remove FILE's normalized-path bucket from
+   PENDING_BY_PATH (a no-op if the table or bucket is absent),
+   appending a resolved event to *BATCH for every still-ACTIVE entry
+   in it and marking each such entry inactive.  Every pending entry
+   in FILE's namesake chain lands in the same bucket, so this replaces
+   the linear same-path scan of the pending list with a single hash
+   lookup plus a walk bounded by that one path's history.  Returns
+   true if at least one active entry was resolved.  */
+static bool
+fsevents_resolve_pending_bucket (Lisp_Object pending_by_path,
+				 Lisp_Object file, Lisp_Object current_actions,
+				 Lisp_Object current_default_action,
+				 Lisp_Object *batch)
+{
+  if (NILP (pending_by_path) || !STRINGP (file))
+    return false;
+
+  struct Lisp_Hash_Table *h = XHASH_TABLE (pending_by_path);
+  Lisp_Object key = fsevents_same_path_key (file);
+  ptrdiff_t idx = hash_find (h, key);
+  if (idx < 0)
+    return false;
+
+  Lisp_Object bucket = Fnreverse (HASH_VALUE (h, idx));
+  hash_remove_from_table (h, key);
+
+  bool any = false;
+  for (Lisp_Object tail = bucket; CONSP (tail); tail = XCDR (tail))
+    {
+      fsevents_debug_count_pending_probe ();
+      Lisp_Object pending = XCAR (tail);
+      if (NILP (PENDING_ACTIVE (pending)))
+	continue;
+      any = true;
+      *batch = Fcons (fsevents_resolve_pending_rename
+		     (pending, file, current_actions, current_default_action),
+		     *batch);
+      PENDING_SET_INACTIVE (pending);
+    }
+  return any;
+}
+
+/* Flush every pending rename onto *BATCH, using CURRENT_FILE/
+   CURRENT_ACTIONS when a later batch entry reuses the same pathname,
+   then reset all four pending-tracking outputs to empty.  Visits the
+   chronological list exactly once, emitting only ACTIVE entries;
+   entries already resolved via fsevents_resolve_pending_bucket or the
+   consecutive-pair check are skipped in place.  Callers at a
+   root-changed or overflow boundary must flush (never leave the
+   pending-by-path table stale) before any later concrete event in the
+   same batch could otherwise resolve against it.  */
+static void
+fsevents_flush_pending_rename (Lisp_Object *pending_head,
+			       Lisp_Object *pending_tail,
+			       Lisp_Object *last_pending,
+			       Lisp_Object *pending_by_path,
+			       Lisp_Object *batch,
+			       Lisp_Object current_file,
+			       Lisp_Object current_actions,
+			       Lisp_Object current_default_action)
+{
+  for (Lisp_Object tail = *pending_head; CONSP (tail); tail = XCDR (tail))
+    {
+      fsevents_debug_count_pending_probe ();
+      Lisp_Object pending = XCAR (tail);
+      if (NILP (PENDING_ACTIVE (pending)))
+	continue;
+      *batch = Fcons (fsevents_resolve_pending_rename (pending, current_file,
+						       current_actions,
+						       current_default_action),
+		     *batch);
+    }
+  *pending_head = Qnil;
+  *pending_tail = Qnil;
+  *last_pending = Qnil;
+  *pending_by_path = Qnil;
 }
 
 /* Generate a file notification event and store it in the keyboard
@@ -1133,9 +1213,24 @@ fsevents_stream_callback (ConstFSEventStreamRef streamRef,
       /* Snapshot filesystem state now, while the callback is still
 	 close to the actual event.  Main-thread processing may run
 	 much later, by which time the path could have been recreated
-	 or removed, breaking rename classification.  */
-      struct stat st;
-      batch->events[i].path_exists = (lstat (paths[i], &st) == 0);
+	 or removed, breaking rename classification.  Only rename
+	 candidates ever consult PATH_EXISTS (see
+	 fsevents_one_sided_rename_action and the pending-rename
+	 pairing logic), so restricting the lstat syscall to them
+	 saves one stat(2) call per non-rename event without changing
+	 observable behavior: PATH_EXISTS defaults to false, which is
+	 what a non-rename entry's PATH_EXISTS was always effectively
+	 unset to before this change, since nothing ever read it.  */
+      batch->events[i].path_exists = false;
+      if (eventFlags[i] & kFSEventStreamEventFlagItemRenamed)
+	{
+	  if (__atomic_load_n (&fsevents_debug_performance_counters_enabled,
+			       __ATOMIC_ACQUIRE))
+	    __atomic_fetch_add (&fsevents_debug_lstat_calls, 1,
+				__ATOMIC_RELAXED);
+	  struct stat st;
+	  batch->events[i].path_exists = (lstat (paths[i], &st) == 0);
+	}
     }
 
   raw_queue_push (batch);
@@ -1151,13 +1246,28 @@ fsevents_stream_callback (ConstFSEventStreamRef streamRef,
 
 static void
 fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
+                                      Lisp_Object const *decoded_paths,
                                       Lisp_Object watch_obj)
 {
+  fsevents_debug_count_watch_dispatch ();
+
   int descriptor = XFIXNUM (WATCH_DESC (watch_obj));
   size_t numEvents = raw->num_events;
   struct raw_event *events = raw->events;
   Lisp_Object batch = Qnil;  /* Built in reverse.  */
-  Lisp_Object pending_rename = Qnil;
+
+  /* Chronological pending-rename list for this watch's dispatch of
+     this batch, plus the O(1) append/lookup helpers above
+     (fsevents_pending_append, fsevents_resolve_pending_bucket,
+     fsevents_flush_pending_rename).  PENDING_TAIL is the last cons of
+     PENDING_HEAD; LAST_PENDING is the most recently appended entry,
+     the only candidate for the consecutive-index pair check;
+     PENDING_BY_PATH indexes every still-pending entry by normalized
+     path for O(1) same-path resolution.  */
+  Lisp_Object pending_head = Qnil;
+  Lisp_Object pending_tail = Qnil;
+  Lisp_Object last_pending = Qnil;
+  Lisp_Object pending_by_path = Qnil;
 
   Lisp_Object resolved_dir = WATCH_RESOLVED_DIR (watch_obj);
   Lisp_Object orig_dir = WATCH_DIR (watch_obj);
@@ -1165,34 +1275,18 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
   for (size_t i = 0; i < numEvents; i++)
     {
       FSEventStreamEventFlags flags = events[i].flags;
-      Lisp_Object actions = Qnil;
       bool is_rename = false;
-      /* Decode the raw physical path and translate it to the
-	 caller's original namespace.  */
+      /* DECODED_PATHS[i] was decoded once per batch by the caller;
+	 only the per-watch namespace translation happens here.  */
       Lisp_Object file
-	= fsevents_decode_and_translate (events[i].path,
-					 resolved_dir, orig_dir);
-      bool starts_new_pair = false;
-      Lisp_Object current_pending = Qnil;
+	= fsevents_translate_path (decoded_paths[i], resolved_dir, orig_dir);
       Lisp_Object current_default_action = Qnil;
-      bool current_handled = false;
+      bool path_exists = events[i].path_exists;
 
-      actions = fsevents_actions_from_flags (flags, &is_rename);
+      Lisp_Object actions = fsevents_actions_from_flags (flags, &is_rename);
 
       if (is_rename)
-	{
-	  bool path_exists = events[i].path_exists;
-	  starts_new_pair = fsevents_rename_starts_new_pair_p (descriptor, file,
-							       path_exists,
-							       events,
-							       i + 1,
-							       numEvents,
-							       resolved_dir,
-							       orig_dir);
-	  current_default_action = fsevents_one_sided_rename_action (path_exists);
-	  current_pending = fsevents_make_pending_rename (descriptor, file, i,
-							  path_exists);
-	}
+	current_default_action = fsevents_one_sided_rename_action (path_exists);
 
       if (flags & kFSEventStreamEventFlagRootChanged)
 	{
@@ -1202,8 +1296,9 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 	     logical watches without forwarding the ancestor path.  */
 	  if (fsevents_watch_root_p (watch_obj, file))
 	    {
-	      fsevents_flush_pending_rename (&pending_rename, &batch,
-					     file, actions,
+	      fsevents_flush_pending_rename (&pending_head, &pending_tail,
+					     &last_pending, &pending_by_path,
+					     &batch, file, actions,
 					     current_default_action);
 	      batch = Fcons (list3 (make_fixnum (descriptor),
 				    nconc2 (actions, list1 (Qstopped)),
@@ -1212,14 +1307,14 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 	    }
 	  else
 	    {
-	      fsevents_flush_pending_rename (&pending_rename, &batch,
-					     Qnil, Qnil, Qnil);
+	      fsevents_flush_pending_rename (&pending_head, &pending_tail,
+					     &last_pending, &pending_by_path,
+					     &batch, Qnil, Qnil, Qnil);
 	      batch = Fcons (list3 (make_fixnum (descriptor),
 				    list1 (Qstopped),
 				    WATCH_FILE (watch_obj)),
 			     batch);
 	    }
-	  pending_rename = Qnil;
 	  break;
 	}
       if (flags & kFSEventStreamEventFlagMustScanSubDirs)
@@ -1234,7 +1329,9 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 	     behavior of reporting the overflow rather than swallowing it.
 	     Deep descendant churn may cause a spurious rescan, but that
 	     is the safe choice -- missing real changes is worse.  */
-	  fsevents_flush_pending_rename (&pending_rename, &batch, file, actions,
+	  fsevents_flush_pending_rename (&pending_head, &pending_tail,
+					 &last_pending, &pending_by_path,
+					 &batch, file, actions,
 					 current_default_action);
 	  if (EQ (WATCH_TYPE (watch_obj), Qt)
 	      && fsevents_path_within_watch_root_p (watch_obj, file))
@@ -1253,129 +1350,95 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
       if (NILP (actions))
 	continue;
 
-      /* Handle rename pairing.  */
-      if (is_rename && !NILP (pending_rename))
+      if (is_rename)
 	{
-	  Lisp_Object prev = Qnil;
-	  Lisp_Object tail = pending_rename;
+	  /* First, resolve any pending entry sharing FILE's normalized
+	     path in O(1) via the hash index.  This covers same-path
+	     pending resolution, including same-path/trailing-slash
+	     equivalence.  This only settles OLDER entries; it never
+	     consumes the current event itself, which independently
+	     still needs to become pending below unless the
+	     consecutive-index pairing check consumes it instead.  */
+	  fsevents_resolve_pending_bucket (pending_by_path, file, actions,
+					   current_default_action, &batch);
 
-	  while (CONSP (tail))
+	  /* Otherwise, FSEvents guarantees rename pairs are consecutive
+	     batch entries, so the only other possible pair partner is
+	     the immediately preceding pending entry.  The pending must
+	     be a source (fallback == delete, absent on disk) and the
+	     current must be a destination (path_exists == true) to
+	     reject two one-sided renames of the same polarity (bulk
+	     move-outs or bulk move-ins).  Note: FSEvents does not
+	     provide a rename cookie, so a move-out at index i followed
+	     by an unrelated move-in at index i+1 in the same batch is
+	     indistinguishable from a real in-tree rename.  This is a
+	     known limitation accepted for the common-case correctness
+	     of in-tree rename detection.  Rename chains (a -> b -> c)
+	     where the midpoint b is absent degrade to one-sided
+	     events, which is also documented.  If LAST_PENDING was
+	     just resolved above (same path as FILE), its ACTIVE flag
+	     is already nil, so the guard below correctly skips it.  */
+	  bool paired = false;
+	  if (!NILP (last_pending))
 	    {
-	      Lisp_Object pending = XCAR (tail);
-	      int pending_desc = XFIXNUM (PENDING_DESC (pending));
-	      Lisp_Object old_file = PENDING_FILE (pending);
-
-	      if (STRINGP (file) && fsevents_same_path_p (old_file, file))
+	      fsevents_debug_count_pending_probe ();
+	      /* Load-bearing invariant: fsevents_resolve_pending_bucket
+		 above already ran for FILE's normalized path this
+		 iteration, so if LAST_PENDING shares that path its
+		 ACTIVE flag is guaranteed nil here.  If a future edit
+		 reorders these two steps this assertion will catch it
+		 before it silently double-pairs a resolved entry.  */
+	      eassert (NILP (PENDING_ACTIVE (last_pending))
+		       || !fsevents_same_path_p (PENDING_FILE (last_pending),
+						 file));
+	      if (!NILP (PENDING_ACTIVE (last_pending))
+		  && PENDING_BATCH_IDX (last_pending) == (ptrdiff_t) i - 1
+		  && EQ (PENDING_ACTION (last_pending), Qdelete)
+		  && path_exists)
 		{
-		  batch = Fcons (fsevents_resolve_pending_rename
-				 (pending, file, actions,
-				  current_default_action),
-				 batch);
-		  if (NILP (prev))
-		    pending_rename = XCDR (tail);
-		  else
-		    XSETCDR (prev, XCDR (tail));
-		  tail = NILP (prev) ? pending_rename : XCDR (prev);
-		  continue;
-		}
+		  Lisp_Object old_file = PENDING_FILE (last_pending);
 
-	      /* FSEvents guarantees that both halves of a rename
-		 are consecutive entries in the callback batch.
-		 Only attempt to pair when the pending entry is
-		 from the immediately preceding batch index.
-		 The pending must be a source (fallback == delete,
-		 absent on disk) and the current must be a
-		 destination (path_exists == true, present on disk)
-		 to reject two one-sided renames of the same
-		 polarity (bulk move-outs or bulk move-ins).
-		 Note: FSEvents does not provide a rename cookie,
-		 so a move-out at index i followed by an unrelated
-		 move-in at index i+1 in the same batch is
-		 indistinguishable from a real in-tree rename.
-		 This is a known limitation accepted for the
-		 common-case correctness of in-tree rename
-		 detection.  Rename chains (a -> b -> c) where
-		 the midpoint b is absent degrade to one-sided
-		 events, which is also documented.  */
-	      if (pending_desc == descriptor
-		  && PENDING_BATCH_IDX (pending) == (ptrdiff_t) i - 1
-		  && EQ (PENDING_ACTION (pending), Qdelete)
-		  && events[i].path_exists)
-		{
 		  if (fsevents_rename_pair_relevant_p (descriptor, old_file,
 						       file))
 		    {
-		      Lisp_Object rename_entry
-			= list4 (make_fixnum (descriptor),
-				 list1 (Qrename), old_file, file);
-		      batch = Fcons (rename_entry, batch);
-		      if (NILP (prev))
-			pending_rename = XCDR (tail);
-		      else
-			XSETCDR (prev, XCDR (tail));
-		      current_handled = true;
-		      break;
+		      batch = Fcons (list4 (make_fixnum (descriptor),
+					    list1 (Qrename), old_file, file),
+				     batch);
+		      PENDING_SET_INACTIVE (last_pending);
+		      paired = true;
 		    }
-
-		  Lisp_Object boundary_entry
-		    = fsevents_cross_boundary_rename_entry (descriptor,
-							    old_file, file);
-		  if (!NILP (boundary_entry))
+		  else
 		    {
-		      batch = Fcons (boundary_entry, batch);
-		      if (NILP (prev))
-			pending_rename = XCDR (tail);
-		      else
-			XSETCDR (prev, XCDR (tail));
-		      current_handled = true;
-		      break;
+		      Lisp_Object boundary_entry
+			= fsevents_cross_boundary_rename_entry (descriptor,
+								old_file, file);
+		      if (!NILP (boundary_entry))
+			{
+			  batch = Fcons (boundary_entry, batch);
+			  PENDING_SET_INACTIVE (last_pending);
+			  paired = true;
+			}
 		    }
 		}
-
-	      prev = tail;
-	      tail = XCDR (tail);
 	    }
 
-	  if (current_handled)
+	  Lisp_Object other_actions = Fdelq (Qrename, actions);
+	  if (paired)
 	    {
-	      Lisp_Object other_actions = Fdelq (Qrename, actions);
 	      if (!NILP (other_actions))
 		batch = Fcons (list3 (make_fixnum (descriptor),
 				      other_actions, file),
 			       batch);
-	      if (starts_new_pair)
-		pending_rename = nconc2 (pending_rename, list1 (current_pending));
-	      else if (is_rename && !events[i].path_exists
-		       && !fsevents_later_event_on_path_p (file, events,
-							   i + 1, numEvents,
-							   resolved_dir,
-							   orig_dir))
-		{
-		  /* The current event was consumed to complete a rename
-		     pair, but the file no longer exists on disk and no
-		     later batch entry covers it.  This means FSEvents
-		     coalesced two transitions into one batch entry: the
-		     file was the destination of the first rename AND the
-		     source of a second rename out of the watched tree.
-		     Emit delete so clients see the departure.  If a
-		     later entry does exist (e.g. a real ItemRemoved),
-		     let that entry handle the delete to avoid
-		     duplicates.  */
-		  batch = Fcons (list3 (make_fixnum (descriptor),
-					list1 (Qdelete), file),
-				 batch);
-		}
 	      continue;
 	    }
-	}
 
-      if (is_rename)
-	{
-	  /* Save as pending rename, waiting for a later batch entry to
-	     resolve or pair it.  */
-	  pending_rename = nconc2 (pending_rename, list1 (current_pending));
+	  /* Not paired: save as pending rename, waiting for a later
+	     batch entry to resolve or pair it.  */
+	  Lisp_Object current_pending
+	    = fsevents_make_pending_rename (descriptor, file, i, path_exists);
+	  fsevents_pending_append (&pending_head, &pending_tail, &last_pending,
+				   &pending_by_path, current_pending);
 	  /* Enqueue non-rename actions if any.  */
-	  Lisp_Object other_actions = Fdelq (Qrename, actions);
 	  if (!NILP (other_actions))
 	    batch = Fcons (list3 (make_fixnum (descriptor),
 				  other_actions, file),
@@ -1389,40 +1452,17 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 	     would miss the delete for a, because the pending rename's
 	     fallback action was computed from the post-batch filesystem
 	     state where a already exists again.  */
-	  if (!NILP (pending_rename))
-	    {
-	      Lisp_Object prev = Qnil;
-	      Lisp_Object tail = pending_rename;
-	      while (CONSP (tail))
-		{
-		  Lisp_Object pending = XCAR (tail);
-		  Lisp_Object pfile = PENDING_FILE (pending);
-		  if (fsevents_same_path_p (pfile, file))
-		    {
-		      batch = Fcons (fsevents_resolve_pending_rename
-				     (pending, file, actions, Qnil),
-				     batch);
-		      if (NILP (prev))
-			pending_rename = XCDR (tail);
-		      else
-			XSETCDR (prev, XCDR (tail));
-		      tail = NILP (prev) ? pending_rename : XCDR (prev);
-		      continue;
-		    }
-		  prev = tail;
-		  tail = XCDR (tail);
-		}
-	    }
+	  fsevents_resolve_pending_bucket (pending_by_path, file, actions,
+					   Qnil, &batch);
 	  batch = Fcons (list3 (make_fixnum (descriptor), actions, file),
 			 batch);
 	}
     }
 
   /* Flush any unpaired pending rename from this batch.  */
-  if (!NILP (pending_rename))
-    {
-      fsevents_flush_pending_rename (&pending_rename, &batch, Qnil, Qnil, Qnil);
-    }
+  if (!NILP (pending_head))
+    fsevents_flush_pending_rename (&pending_head, &pending_tail, &last_pending,
+				   &pending_by_path, &batch, Qnil, Qnil, Qnil);
 
   /* Reverse the batch to restore chronological order, then dispatch
      each event.  */
@@ -1477,21 +1517,40 @@ fsevents_process_raw_batch (struct raw_batch *raw)
   if (!CONSP (stream_entry))
     return;
 
+  fsevents_debug_count_batch_prepare ();
+
+  /* Decode each raw physical path exactly once per batch, then hand
+     every logical watch sharing this stream the same immutable
+     array; only the per-watch namespace translation
+     (fsevents_translate_path) still runs once per watch per event.
+     No allocation is needed for an empty batch: the callee's
+     zero-iteration loop never dereferences DECODED_PATHS.  */
+  Lisp_Object *decoded_paths = NULL;
+  USE_SAFE_ALLOCA;
+  if (raw->num_events)
+    {
+      SAFE_ALLOCA_LISP (decoded_paths, raw->num_events);
+      for (size_t i = 0; i < raw->num_events; i++)
+	decoded_paths[i] = DECODE_FILE (build_unibyte_string (raw->events[i].path));
+    }
+
   if (FIXNUMP (STREAM_RETIRED_TO (stream_entry)))
     for (Lisp_Object tail = STREAM_RETIRED_WATCHES (stream_entry);
          CONSP (tail); tail = XCDR (tail))
       {
         Lisp_Object watch_obj = fsevents_find_watch (XFIXNUM (XCAR (tail)));
         if (CONSP (watch_obj))
-          fsevents_process_raw_batch_for_watch (raw, watch_obj);
+          fsevents_process_raw_batch_for_watch (raw, decoded_paths, watch_obj);
       }
   else
     for (Lisp_Object tail = watch_list; CONSP (tail); tail = XCDR (tail))
       {
         Lisp_Object watch_obj = XCAR (tail);
         if (XFIXNUM (WATCH_STREAM_ID (watch_obj)) == raw->stream_id)
-          fsevents_process_raw_batch_for_watch (raw, watch_obj);
+          fsevents_process_raw_batch_for_watch (raw, decoded_paths, watch_obj);
       }
+
+  SAFE_FREE ();
 }
 
 
@@ -2016,6 +2075,106 @@ DEFUN ("fsevents--debug-handle-pipe-ready", Ffsevents_debug_handle_pipe_ready,
   return Qnil;
 }
 
+DEFUN ("fsevents--debug-reset-performance-counters",
+       Ffsevents_debug_reset_performance_counters,
+       Sfsevents_debug_reset_performance_counters, 0, 0, 0,
+       doc: /* Reset FSEvents performance counters to zero and enable them.
+
+Synchronizes the GCD callback queue first so that setup callbacks
+already in flight cannot race past the reset.  Counting stays enabled
+until Emacs exits; only the counter values are meant to be
+test-local.  */)
+  (void)
+{
+  fsevents_sync_callback_queue ();
+  fsevents_debug_batch_prepares = 0;
+  fsevents_debug_watch_dispatches = 0;
+  fsevents_debug_pending_probes = 0;
+  __atomic_store_n (&fsevents_debug_lstat_calls, 0, __ATOMIC_RELEASE);
+  __atomic_store_n (&fsevents_debug_performance_counters_enabled, true,
+                    __ATOMIC_RELEASE);
+  return Qnil;
+}
+
+DEFUN ("fsevents--debug-performance-counters",
+       Ffsevents_debug_performance_counters,
+       Sfsevents_debug_performance_counters, 0, 0, 0,
+       doc: /* Return (BATCH-PREPARES WATCH-DISPATCHES PENDING-PROBES LSTAT-CALLS).  */)
+  (void)
+{
+  uintmax_t lstat_calls
+    = __atomic_load_n (&fsevents_debug_lstat_calls, __ATOMIC_ACQUIRE);
+  return list4 (make_uint (fsevents_debug_batch_prepares),
+                make_uint (fsevents_debug_watch_dispatches),
+                make_uint (fsevents_debug_pending_probes),
+                make_uint (lstat_calls));
+}
+
+DEFUN ("fsevents--debug-enqueue-rename-batch",
+       Ffsevents_debug_enqueue_rename_batch,
+       Sfsevents_debug_enqueue_rename_batch, 2, 2, 0,
+       doc: /* Enqueue a synthetic all-ItemRenamed batch for tests.
+
+STREAM-ID is the native stream to attribute the batch to.  EVENTS is
+a list of (PATH EXISTS) entries; each becomes one rename-flagged raw
+event, with PATH_EXISTS set from non-nil EXISTS.  */)
+  (Lisp_Object stream_id, Lisp_Object events)
+{
+  CHECK_FIXNUM (stream_id);
+  CHECK_LIST (events);
+
+  ptrdiff_t num_events = 0;
+  for (Lisp_Object tail = events; CONSP (tail); tail = XCDR (tail))
+    {
+      Lisp_Object entry = XCAR (tail);
+      if (!CONSP (entry) || !STRINGP (XCAR (entry)) || !CONSP (XCDR (entry))
+          || !NILP (XCDR (XCDR (entry))))
+        xsignal2 (Qfile_notify_error,
+                  build_string ("Malformed rename batch entry; expected (PATH EXISTS)"),
+                  entry);
+      num_events++;
+    }
+
+  fsevents_ensure_pipe ();
+
+  struct raw_batch *batch = malloc (sizeof *batch);
+  if (!batch)
+    memory_full (SIZE_MAX);
+  batch->stream_id = XFIXNUM (stream_id);
+  batch->num_events = num_events;
+  batch->events
+    = num_events ? malloc (sizeof *batch->events * num_events) : NULL;
+  if (num_events && !batch->events)
+    {
+      free (batch);
+      memory_full (SIZE_MAX);
+    }
+
+  ptrdiff_t i = 0;
+  for (Lisp_Object tail = events; CONSP (tail); tail = XCDR (tail), i++)
+    {
+      Lisp_Object entry = XCAR (tail);
+      Lisp_Object path = XCAR (entry);
+      Lisp_Object exists = XCAR (XCDR (entry));
+      Lisp_Object encoded = ENCODE_FILE (path);
+      char *copy = strdup (SSDATA (encoded));
+      if (!copy)
+        {
+          for (ptrdiff_t j = 0; j < i; j++)
+            free (batch->events[j].path);
+          free (batch->events);
+          free (batch);
+          memory_full (SIZE_MAX);
+        }
+      batch->events[i].path = copy;
+      batch->events[i].flags = kFSEventStreamEventFlagItemRenamed;
+      batch->events[i].path_exists = !NILP (exists);
+    }
+
+  raw_queue_push (batch);
+  return Qnil;
+}
+
 
 void
 globals_of_fsevents (void)
@@ -2026,6 +2185,11 @@ globals_of_fsevents (void)
   next_stream_id = 0;
   fsevents_debug_inject_batch_during_read = false;
   fsevents_debug_inject_stream_id = -1;
+  fsevents_debug_performance_counters_enabled = false;
+  fsevents_debug_batch_prepares = 0;
+  fsevents_debug_watch_dispatches = 0;
+  fsevents_debug_pending_probes = 0;
+  fsevents_debug_lstat_calls = 0;
 }
 
 void
@@ -2045,6 +2209,9 @@ syms_of_fsevents (void)
   defsubr (&Sfsevents_debug_write_wake_bytes);
   defsubr (&Sfsevents_debug_drain_wake_bytes);
   defsubr (&Sfsevents_debug_handle_pipe_ready);
+  defsubr (&Sfsevents_debug_reset_performance_counters);
+  defsubr (&Sfsevents_debug_performance_counters);
+  defsubr (&Sfsevents_debug_enqueue_rename_batch);
 
   /* Event types.  */
   DEFSYM (Qcreate, "create");

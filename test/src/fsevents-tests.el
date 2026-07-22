@@ -40,6 +40,9 @@
 (declare-function fsevents--debug-write-wake-bytes "fsevents.m" (count))
 (declare-function fsevents--debug-drain-wake-bytes "fsevents.m" ())
 (declare-function fsevents--debug-handle-pipe-ready "fsevents.m" ())
+(declare-function fsevents--debug-reset-performance-counters "fsevents.m" ())
+(declare-function fsevents--debug-performance-counters "fsevents.m" ())
+(declare-function fsevents--debug-enqueue-rename-batch "fsevents.m" (stream-id events))
 
 (defconst fsevents-tests--available (featurep 'fsevents)
   "Non-nil if the fsevents backend is available.
@@ -50,6 +53,19 @@ configurations: GUI, daemon, terminal, and batch mode.")
   "Busy-wait for SECONDS without entering the Emacs event loop."
   (let ((deadline (+ (float-time) seconds)))
     (while (< (float-time) deadline))))
+
+(defun fsevents-tests--pump-events (seconds)
+  "Dispatch queued special events (e.g. `file-notify') for SECONDS.
+
+In `--batch' mode, `sit-for' does not run the command loop far enough
+to dispatch `special-event-map' bindings for already-queued
+`file-notify' events; `read-event' does.  Tests that wait for a
+callback to fire (whether from a real FSEvents callback or from a
+synthetic batch injected via the debug helpers) must pump with this
+function instead of `sit-for'."
+  (let ((deadline (+ (float-time) seconds)))
+    (while (< (float-time) deadline)
+      (read-event nil nil 0.05))))
 
 (ert-deftest fsevents-test-add-watch ()
   "Test that `fsevents-add-watch' returns an integer descriptor."
@@ -164,7 +180,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (setq root-desc (fsevents-add-watch
                            tmpdir '(create)
                            (lambda (ev) (push ev root-events))))
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (memq 'create (nth 1 ev))
                                   (equal testfile (nth 2 ev))))
@@ -209,7 +225,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
         (progn
           (write-region "hello" nil (expand-file-name "newfile.txt" tmpdir))
           ;; Wait for FSEvents to deliver the event.
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'create (nth 1 ev)))
                            events)))
@@ -271,10 +287,13 @@ configurations: GUI, daemon, terminal, and batch mode.")
                  (lambda (ev) (push ev root-events))))
           (should (= (fsevents--debug-watch-stream-id file-desc)
                      (fsevents--debug-watch-stream-id root-desc)))
+          (fsevents-tests--pump-events 1)
+          (setq events nil root-events nil)
+
           (fsevents--debug-enqueue-overflow-batch
            (fsevents--debug-watch-stream-id root-desc)
            subdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should-not events)
           (should (cl-some (lambda (ev)
                              (and (memq 'create (nth 1 ev))
@@ -328,7 +347,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-overflow-batch
            (fsevents--debug-watch-stream-id busy-desc)
            busy-deep)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (memq 'create (nth 1 ev))
                                   (equal busy-dir (nth 2 ev))))
@@ -365,7 +384,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-overflow-write-batch
            (fsevents--debug-watch-stream-id root-desc)
            subdir testfile)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (memq 'write (nth 1 ev))
                                   (equal testfile (nth 2 ev))))
@@ -400,7 +419,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-delete-batch
            (fsevents--debug-watch-stream-id root-desc)
            subdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'stopped (nth 1 ev)))
                            events))
@@ -431,7 +450,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-delete-batch
            (fsevents--debug-watch-stream-id root-desc)
            subdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'delete (nth 1 ev)))
                            events))
@@ -465,7 +484,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-root-changed-batch
            (fsevents--debug-watch-stream-id root-desc)
            tmpdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (equal subdir (nth 2 ev))
                                   (equal '(stopped) (nth 1 ev))))
@@ -499,7 +518,7 @@ configurations: GUI, daemon, terminal, and batch mode.")
           (fsevents--debug-enqueue-delete-batch
            (fsevents--debug-watch-stream-id desc)
            subdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (equal subdir (nth 2 ev))
                                   (memq 'delete (nth 1 ev))))
@@ -517,14 +536,14 @@ configurations: GUI, daemon, terminal, and batch mode.")
          (events nil)
          desc)
     (write-region "initial" nil testfile)
-    (sit-for 0.5) ;; Let the file settle before watching.
+    (fsevents-tests--pump-events 0.5) ;; Let the file settle before watching.
     (setq desc (fsevents-add-watch
                 tmpdir '(create delete write attrib rename)
                 (lambda (ev) (push ev events))))
     (unwind-protect
         (progn
           (write-region "modified" nil testfile)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'write (nth 1 ev)))
                            events)))
@@ -539,14 +558,14 @@ configurations: GUI, daemon, terminal, and batch mode.")
          (events nil)
          desc)
     (write-region "content" nil testfile)
-    (sit-for 0.5)
+    (fsevents-tests--pump-events 0.5)
     (setq desc (fsevents-add-watch
                 tmpdir '(create delete write attrib rename)
                 (lambda (ev) (push ev events))))
     (unwind-protect
         (progn
           (delete-file testfile)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'delete (nth 1 ev)))
                            events)))
@@ -574,14 +593,16 @@ stops the direct watch."
         (progn
           (should (integerp desc))
           (should (eq t (fsevents-valid-p desc)))
+          (fsevents-tests--pump-events 1)
+          (setq events nil)
           ;; Writing to the target through the symlink: no events.
           (write-region "modified" nil link-file)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should-not events)
           ;; Deleting the symlink should preserve the terminal marker
           ;; for direct callers and invalidate the watch.
           (delete-file link-file)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (equal link-file (nth 2 ev))
                                   (equal '(delete stopped) (nth 1 ev))))
@@ -604,8 +625,10 @@ stops the direct watch."
     (unwind-protect
         (progn
           (should (integerp desc))
+          (fsevents-tests--pump-events 1)
+          (setq events nil)
           (write-region "hello" nil (expand-file-name "child.txt" tmpdir))
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should-not events))
       (when (fsevents-valid-p desc)
         (fsevents-rm-watch desc))
@@ -626,11 +649,13 @@ stops the direct watch."
                 (lambda (ev) (push ev events))))
     (unwind-protect
         (progn
+          (fsevents-tests--pump-events 1)
+          (setq events nil)
           (write-region "hello" nil (expand-file-name "child.txt" tmpdir))
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should-not events)
           (delete-file linkdir)
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (and (equal linkdir (nth 2 ev))
                                   (equal '(delete stopped) (nth 1 ev))))
@@ -661,7 +686,7 @@ E.g. /tmp/real/sub where /tmp/link -> /tmp/real, watching /tmp/link/sub."
           (should (integerp desc))
           (write-region "data" nil
                         (expand-file-name "mid-link.txt" link-subdir))
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           (should (cl-some (lambda (ev)
                              (memq 'create (nth 1 ev)))
                            events)))
@@ -690,7 +715,7 @@ events should report paths under /tmp/link/sub, not /tmp/real/sub."
           (should (integerp desc))
           (write-region "data" nil
                         (expand-file-name "ns-test.txt" link-subdir))
-          (sit-for 1)
+          (fsevents-tests--pump-events 1)
           ;; Event path should use the caller's link-subdir prefix,
           ;; not the resolved realdir prefix.
           (let ((create-ev (cl-find-if (lambda (ev)
@@ -718,5 +743,194 @@ events should report paths under /tmp/link/sub, not /tmp/real/sub."
   ;; Invalid descriptor should signal an error.
   (should-error (fsevents-rm-watch 99999)
                 :type 'file-notify-error))
+
+(ert-deftest fsevents-test-file-rename-event ()
+  "Renaming a watched file should generate one exact rename event."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (oldfile (expand-file-name "old.py" tmpdir))
+         (newfile (expand-file-name "new.py" tmpdir))
+         (events nil)
+         (desc (fsevents-add-watch
+                tmpdir '(create delete write attrib rename)
+                (lambda (ev) (push ev events)))))
+    (unwind-protect
+        (progn
+          (write-region "x = 1\n" nil oldfile)
+          (fsevents-tests--pump-events 1)
+          (setq events nil)
+          (rename-file oldfile newfile)
+          (fsevents-tests--pump-events 1)
+          (should (cl-some (lambda (ev)
+                             (and (memq 'rename (nth 1 ev))
+                                  (equal oldfile (nth 2 ev))
+                                  (equal newfile (nth 3 ev))))
+                           events)))
+      (fsevents-rm-watch desc)
+      (delete-directory tmpdir t))))
+
+(ert-deftest fsevents-test-rename-pair-across-shared-siblings ()
+  "A rename inside one promoted sibling must not leak to another."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (subdirs (mapcar (lambda (n)
+                            (expand-file-name (format "d%d" n) tmpdir))
+                          (number-sequence 1 8)))
+         (busy-dir (car subdirs))
+         (quiet-dir (cadr subdirs))
+         (oldfile (expand-file-name "old.py" busy-dir))
+         (newfile (expand-file-name "new.py" busy-dir))
+         (busy-events nil)
+         (quiet-events nil)
+         (descs nil)
+         busy-desc quiet-desc)
+    (dolist (dir subdirs)
+      (make-directory dir))
+    (write-region "x = 1\n" nil oldfile)
+    (unwind-protect
+        (progn
+          (dolist (dir subdirs)
+            (cond
+             ((equal dir busy-dir)
+              (setq busy-desc
+                    (fsevents-add-watch
+                     dir '(delete rename)
+                     (lambda (ev) (push ev busy-events))))
+              (push busy-desc descs))
+             ((equal dir quiet-dir)
+              (setq quiet-desc
+                    (fsevents-add-watch
+                     dir '(delete rename)
+                     (lambda (ev) (push ev quiet-events))))
+              (push quiet-desc descs))
+             (t
+              (push (fsevents-add-watch dir '(delete rename) #'ignore)
+                    descs))))
+          (should (= 1 (fsevents--debug-stream-count)))
+          (should (= (fsevents--debug-watch-stream-id busy-desc)
+                     (fsevents--debug-watch-stream-id quiet-desc)))
+          (fsevents-tests--pump-events 1)
+          (setq busy-events nil quiet-events nil)
+          (rename-file oldfile newfile)
+          (fsevents-tests--pump-events 1)
+          (should (cl-some (lambda (ev)
+                             (and (memq 'rename (nth 1 ev))
+                                  (equal oldfile (nth 2 ev))
+                                  (equal newfile (nth 3 ev))))
+                           busy-events))
+          (should-not quiet-events))
+      (dolist (desc descs)
+        (when (fsevents-valid-p desc)
+          (fsevents-rm-watch desc)))
+      (delete-directory tmpdir t))))
+
+(ert-deftest fsevents-test-same-path-trailing-slash-order ()
+  "A synthetic rename batch reusing the same path (with and without a
+trailing slash) must resolve in chronological order: create then
+delete."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (path (expand-file-name "leaf" tmpdir))
+         (path/ (concat path "/"))
+         (events nil)
+         (desc (fsevents-add-watch
+                tmpdir '(create delete write attrib rename)
+                (lambda (ev) (push ev events))))
+         (sid (fsevents--debug-watch-stream-id desc)))
+    (unwind-protect
+        (progn
+          (fsevents--debug-enqueue-rename-batch
+           sid (list (list path nil) (list path/ nil)))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 1)
+          (setq events (cl-remove-if-not
+                        (lambda (ev) (member (nth 2 ev) (list path path/)))
+                        (nreverse events)))
+          (should (equal (mapcar (lambda (ev) (car (nth 1 ev))) events)
+                        '(create delete)))
+          (should (equal path (nth 2 (nth 0 events))))
+          (should (equal path/ (nth 2 (nth 1 events)))))
+      (fsevents-rm-watch desc)
+      (delete-directory tmpdir t))))
+
+(ert-deftest fsevents-test-shared-one-sided-renames-stay-linear ()
+  "A 200-entry one-sided rename batch shared by 8 promoted sibling
+watches must resolve in a bounded number of pending-list probes."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (subdirs (mapcar (lambda (n)
+                            (expand-file-name (format "d%d" n) tmpdir))
+                          (number-sequence 1 8)))
+         (busy-dir (car subdirs))
+         (busy-events nil)
+         (quiet-events nil)
+         (descs nil)
+         busy-desc sid)
+    (dolist (dir subdirs)
+      (make-directory dir))
+    (unwind-protect
+        (progn
+          (dolist (dir subdirs)
+            (if (equal dir busy-dir)
+                (progn
+                  (setq busy-desc
+                        (fsevents-add-watch
+                         dir '(delete rename)
+                         (lambda (ev) (push ev busy-events))))
+                  (push busy-desc descs))
+              (push (fsevents-add-watch
+                     dir '(delete rename)
+                     (lambda (ev) (push ev quiet-events)))
+                    descs)))
+          (should (= 1 (fsevents--debug-stream-count)))
+          (setq sid (fsevents--debug-watch-stream-id busy-desc))
+          (fsevents-tests--pump-events 1)
+          (setq busy-events nil quiet-events nil)
+          (let ((entries
+                 (mapcar (lambda (n)
+                           (list (expand-file-name (format "f%d.py" n)
+                                                    busy-dir)
+                                 nil))
+                         (number-sequence 0 199))))
+            (fsevents--debug-reset-performance-counters)
+            (fsevents--debug-enqueue-rename-batch sid entries)
+            (fsevents--debug-handle-pipe-ready))
+          (fsevents-tests--pump-events 1)
+          (cl-destructuring-bind (prepares dispatches probes lstat-calls)
+              (fsevents--debug-performance-counters)
+            (should (= prepares 1))
+            (should (= dispatches 8))
+            (should (<= probes 3200))
+            (should (= lstat-calls 0)))
+          (should (= 200 (length busy-events)))
+          (should (cl-every (lambda (ev) (memq 'delete (nth 1 ev)))
+                            busy-events)))
+          (should-not quiet-events)
+      (dolist (desc descs)
+        (when (fsevents-valid-p desc)
+          (fsevents-rm-watch desc)))
+      (delete-directory tmpdir t))))
+
+(ert-deftest fsevents-test-non-rename-callback-does-not-lstat ()
+  "A non-rename real filesystem event must not call lstat from the
+GCD callback thread."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (testfile (expand-file-name "target.txt" tmpdir)))
+    (write-region "x" nil testfile)
+    (let* ((events nil)
+           (desc (fsevents-add-watch
+                  testfile '(write)
+                  (lambda (ev) (push ev events)))))
+      (unwind-protect
+          (progn
+            (fsevents-tests--pump-events 1)
+            (fsevents--debug-reset-performance-counters)
+            (write-region "x" nil testfile t 'silent)
+            (fsevents-tests--pump-events 1)
+            (should (cl-some (lambda (ev) (memq 'write (nth 1 ev))) events))
+            (should (= 0 (nth 3 (fsevents--debug-performance-counters)))))
+        (fsevents-rm-watch desc)
+        (delete-directory tmpdir t)))))
 
 ;;; fsevents-tests.el ends here
