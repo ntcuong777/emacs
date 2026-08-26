@@ -394,10 +394,41 @@ DESC is the back-end descriptor.  ACTIONS is a list of:
           (file-notify-rm-watch desc))))))
 
 (declare-function fsevents-add-watch "fsevents.m" (file flags callback))
+(declare-function fsevents--set-event-queue-limit "fsevents.m" (limit))
 (declare-function inotify-add-watch "inotify.c" (file flags callback))
 (declare-function kqueue-add-watch "kqueue.c" (file flags callback))
 (declare-function w32notify-add-watch "w32notify.c" (file flags callback))
 (declare-function gfile-add-watch "gfilenotify.c" (file flags callback))
+
+(defun file-notify--set-fsevents-event-limit (symbol value)
+  "Set SYMBOL to VALUE and update the FSEvents event queue limit."
+  (unless (or (null value)
+              (and (integerp value) (> value 0)))
+    (error "FSEvents event limit must be nil or a positive integer"))
+  (when (featurep 'fsevents)
+    (fsevents--set-event-queue-limit value))
+  (set-default symbol value))
+
+(defcustom file-notify-fsevents-event-limit 1024
+  "Maximum number of pending raw FSEvents events.
+
+While the pending raw-event count stays within this limit, FSEvents
+preserves the exact path, action, and ordering of notifications.  When
+the limit is crossed, intermediate detail for the overloaded native
+stream is dropped and one rescan notification is emitted for each
+logical watch on that stream.  A smaller limit bounds memory, main-thread
+conversion, and callback debt more aggressively; a larger limit preserves
+more detail but permits longer UI stalls.  A value of nil is lossless
+and unbounded, but can reproduce multi-minute freezes during large
+filesystem storms.
+
+Use Customize or `customize-set-variable' to change this setting while
+Emacs is running.  A raw `setq' after this library is loaded bypasses
+the custom setter and must not be used for live changes."
+  :group 'files
+  :type '(choice (const :tag "Unlimited" nil)
+                 (integer :tag "Maximum pending events"))
+  :set #'file-notify--set-fsevents-event-limit)
 
 (defun file-notify--add-watch-fsevents (file _dir flags)
   "Add a watch for FILE in DIR with FLAGS, using fsevents."

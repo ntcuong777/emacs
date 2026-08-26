@@ -137,13 +137,15 @@ struct raw_batch
   int stream_id;
   size_t num_events;
   struct raw_event *events;         /* Array of num_events entries.  */
+  bool overflow;
   struct raw_batch *next;
 };
 
 static pthread_mutex_t raw_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct raw_batch *raw_queue_head;
 static struct raw_batch *raw_queue_tail;
-
+static size_t raw_queue_num_events;
+static size_t fsevents_event_queue_limit = 1024;
 static void raw_batch_free (struct raw_batch *batch);
 static void raw_queue_push_without_wake (struct raw_batch *batch);
 
@@ -186,6 +188,16 @@ fsevents_debug_count_pending_probe (void)
     fsevents_debug_pending_probes++;
 }
 
+static void
+raw_batch_init (struct raw_batch *batch, int stream_id, size_t num_events)
+{
+  batch->stream_id = stream_id;
+  batch->num_events = num_events;
+  batch->events = NULL;
+  batch->overflow = false;
+  batch->next = NULL;
+}
+
 static struct raw_batch *
 raw_batch_make_empty (int stream_id)
 {
@@ -193,10 +205,7 @@ raw_batch_make_empty (int stream_id)
   if (!batch)
     memory_full (SIZE_MAX);
 
-  batch->stream_id = stream_id;
-  batch->num_events = 0;
-  batch->events = NULL;
-  batch->next = NULL;
+  raw_batch_init (batch, stream_id, 0);
   return batch;
 }
 
@@ -204,6 +213,43 @@ raw_batch_make_empty (int stream_id)
    dispatch queue thread).  The pipe write is done under the same mutex that
    fsevents_close_pipe acquires before invalidating the pipe FDs, so
    we never write to a closed/reused descriptor.  */
+static bool
+raw_queue_has_overflow_marker (int stream_id)
+{
+  for (struct raw_batch *tail = raw_queue_head; tail; tail = tail->next)
+    if (tail->stream_id == stream_id && tail->overflow)
+      return true;
+  return false;
+}
+
+static void
+raw_queue_drop_stream_batches (int stream_id)
+{
+  struct raw_batch **link = &raw_queue_head;
+  struct raw_batch *previous = NULL;
+
+  while (*link)
+    {
+      struct raw_batch *batch = *link;
+      if (batch->stream_id == stream_id && !batch->overflow)
+        {
+          *link = batch->next;
+          if (batch == raw_queue_tail)
+            raw_queue_tail = previous;
+          raw_queue_num_events -= batch->num_events;
+          raw_batch_free (batch);
+        }
+      else
+        {
+          previous = batch;
+          link = &batch->next;
+        }
+    }
+
+  if (!raw_queue_head)
+    raw_queue_tail = NULL;
+}
+
 static void
 raw_queue_push_1 (struct raw_batch *batch, bool wake)
 {
@@ -220,11 +266,38 @@ raw_queue_push_1 (struct raw_batch *batch, bool wake)
       raw_batch_free (batch);
       return;
     }
-  if (raw_queue_tail)
-    raw_queue_tail->next = batch;
-  else
-    raw_queue_head = batch;
-  raw_queue_tail = batch;
+
+  bool discard = false;
+  size_t limit
+    = __atomic_load_n (&fsevents_event_queue_limit, __ATOMIC_ACQUIRE);
+  if (raw_queue_has_overflow_marker (batch->stream_id))
+    discard = true;
+  else if (batch->overflow)
+    raw_queue_drop_stream_batches (batch->stream_id);
+  else if (limit != 0 && !batch->overflow && batch->num_events > 0
+           && (batch->num_events > limit
+               || raw_queue_num_events > limit - batch->num_events))
+    {
+      raw_queue_drop_stream_batches (batch->stream_id);
+      for (size_t i = 0; i < batch->num_events; i++)
+        free (batch->events[i].path);
+      free (batch->events);
+      batch->events = NULL;
+      batch->num_events = 0;
+      batch->overflow = true;
+    }
+
+  if (!discard)
+    {
+      if (raw_queue_tail)
+        raw_queue_tail->next = batch;
+      else
+        raw_queue_head = batch;
+      raw_queue_tail = batch;
+      if (!batch->overflow)
+        raw_queue_num_events += batch->num_events;
+    }
+
   if (wake)
     {
       /* Wake the event loop while still holding the lock.  */
@@ -232,6 +305,9 @@ raw_queue_push_1 (struct raw_batch *batch, bool wake)
       (void) write (fsevents_pipe[1], &byte, 1);
     }
   pthread_mutex_unlock (&raw_queue_mutex);
+
+  if (discard)
+    raw_batch_free (batch);
 }
 
 static void
@@ -255,6 +331,7 @@ raw_queue_drain (void)
   struct raw_batch *head = raw_queue_head;
   raw_queue_head = NULL;
   raw_queue_tail = NULL;
+  raw_queue_num_events = 0;
   pthread_mutex_unlock (&raw_queue_mutex);
   return head;
 }
@@ -1079,16 +1156,34 @@ fsevents_flush_pending_rename (Lisp_Object *pending_head,
   *pending_by_path = Qnil;
 }
 
+static void
+fsevents_store_notify_event (Lisp_Object watch_object, Lisp_Object actions,
+                             Lisp_Object file, Lisp_Object file1)
+{
+  if (!NILP (actions))
+    {
+      struct input_event event;
+      EVENT_INIT (event);
+      event.kind = FILE_NOTIFY_EVENT;
+      event.frame_or_window = Qnil;
+      event.arg = list2 (Fcons (WATCH_DESC (watch_object),
+                                Fcons (actions,
+                                       NILP (file1)
+                                       ? list1 (file)
+                                       : list2 (file, file1))),
+                         WATCH_CALLBACK (watch_object));
+      kbd_buffer_store_event (&event);
+    }
+}
+
 /* Generate a file notification event and store it in the keyboard
    buffer.  Return true if the watch was rewritten to stopped and
    should be disposed by the caller.  */
 static bool
 fsevents_generate_event (Lisp_Object watch_object, Lisp_Object actions,
-			 Lisp_Object file, Lisp_Object file1)
+                         Lisp_Object file, Lisp_Object file1)
 {
   Lisp_Object flags, action, entry;
-  struct input_event event;
-
   /* Symlink-leaf watches emulate inotify IN_DONT_FOLLOW semantics:
      the link entry is watched, not its target.  Only attribute
      changes are surfaced.  Delete/rename of the watched symlink leaf
@@ -1159,19 +1254,7 @@ fsevents_generate_event (Lisp_Object watch_object, Lisp_Object actions,
   } while (1);
 
   /* Store it into the input event queue.  */
-  if (! NILP (actions))
-    {
-      EVENT_INIT (event);
-      event.kind = FILE_NOTIFY_EVENT;
-      event.frame_or_window = Qnil;
-      event.arg = list2 (Fcons (WATCH_DESC (watch_object),
-				Fcons (actions,
-				       NILP (file1)
-				       ? list1 (file)
-				       : list2 (file, file1))),
-			 WATCH_CALLBACK (watch_object));
-      kbd_buffer_store_event (&event);
-    }
+  fsevents_store_notify_event (watch_object, actions, file, file1);
   return needs_dispose;
 }
 
@@ -1197,8 +1280,16 @@ fsevents_stream_callback (ConstFSEventStreamRef streamRef,
   if (!batch)
     return;
 
-  batch->stream_id = stream_id;
-  batch->num_events = numEvents;
+  raw_batch_init (batch, stream_id, numEvents);
+  size_t limit
+    = __atomic_load_n (&fsevents_event_queue_limit, __ATOMIC_ACQUIRE);
+  if (limit != 0 && numEvents > limit)
+    {
+      batch->num_events = 0;
+      batch->overflow = true;
+      raw_queue_push (batch);
+      return;
+    }
   batch->events = malloc (numEvents * sizeof *batch->events);
   if (!batch->events)
     {
@@ -1511,6 +1602,22 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 }
 
 static void
+fsevents_process_overflow_for_watch (Lisp_Object watch_obj)
+{
+  fsevents_debug_count_watch_dispatch ();
+
+  Lisp_Object actions;
+  if (EQ (WATCH_TYPE (watch_obj), Qt))
+    actions = list1 (Qcreate);
+  else if (EQ (WATCH_TYPE (watch_obj), Qsymlink))
+    actions = list1 (Qattrib);
+  else
+    actions = list1 (Qwrite);
+
+  fsevents_store_notify_event (watch_obj, actions, WATCH_FILE (watch_obj), Qnil);
+}
+
+static void
 fsevents_process_raw_batch (struct raw_batch *raw)
 {
   Lisp_Object stream_entry = fsevents_find_stream (raw->stream_id);
@@ -1518,6 +1625,26 @@ fsevents_process_raw_batch (struct raw_batch *raw)
     return;
 
   fsevents_debug_count_batch_prepare ();
+
+  if (raw->overflow)
+    {
+      if (FIXNUMP (STREAM_RETIRED_TO (stream_entry)))
+        for (Lisp_Object tail = STREAM_RETIRED_WATCHES (stream_entry);
+             CONSP (tail); tail = XCDR (tail))
+          {
+            Lisp_Object watch_obj = fsevents_find_watch (XFIXNUM (XCAR (tail)));
+            if (CONSP (watch_obj))
+              fsevents_process_overflow_for_watch (watch_obj);
+          }
+      else
+        for (Lisp_Object tail = watch_list; CONSP (tail); tail = XCDR (tail))
+          {
+            Lisp_Object watch_obj = XCAR (tail);
+            if (XFIXNUM (WATCH_STREAM_ID (watch_obj)) == raw->stream_id)
+              fsevents_process_overflow_for_watch (watch_obj);
+          }
+      return;
+    }
 
   /* Decode each raw physical path exactly once per batch, then hand
      every logical watch sharing this stream the same immutable
@@ -1531,7 +1658,7 @@ fsevents_process_raw_batch (struct raw_batch *raw)
     {
       SAFE_ALLOCA_LISP (decoded_paths, raw->num_events);
       for (size_t i = 0; i < raw->num_events; i++)
-	decoded_paths[i] = DECODE_FILE (build_unibyte_string (raw->events[i].path));
+        decoded_paths[i] = DECODE_FILE (build_unibyte_string (raw->events[i].path));
     }
 
   if (FIXNUMP (STREAM_RETIRED_TO (stream_entry)))
@@ -1627,6 +1754,7 @@ fsevents_close_pipe (void)
   struct raw_batch *stale = raw_queue_head;
   raw_queue_head = NULL;
   raw_queue_tail = NULL;
+  raw_queue_num_events = 0;
   pthread_mutex_unlock (&raw_queue_mutex);
 
   /* Free any batches that were queued but never processed.  */
@@ -1811,6 +1939,34 @@ invalid.  */)
   return NILP (assq_no_quit (watch_descriptor, watch_list)) ? Qnil : Qt;
 }
 
+DEFUN ("fsevents--set-event-queue-limit", Ffsevents_set_event_queue_limit,
+       Sfsevents_set_event_queue_limit, 1, 1, 0,
+       doc: /* Set the maximum number of pending raw FSEvents events.
+
+LIMIT must be nil or a positive integer.  Nil means unlimited.  */)
+  (Lisp_Object limit)
+{
+  size_t value;
+
+  if (NILP (limit))
+    value = 0;
+  else
+    {
+      if (!INTEGERP (limit))
+        wrong_type_argument (Qintegerp, limit);
+
+      uintmax_t n;
+      if (!integer_to_uintmax (limit, &n) || n == 0 || n > SIZE_MAX)
+        xsignal2 (Qfile_notify_error,
+                  build_string ("FSEvents event limit is out of range"),
+                  limit);
+      value = (size_t) n;
+    }
+
+  __atomic_store_n (&fsevents_event_queue_limit, value, __ATOMIC_RELEASE);
+  return Qnil;
+}
+
 DEFUN ("fsevents--debug-stream-count", Ffsevents_debug_stream_count,
        Sfsevents_debug_stream_count, 0, 0, 0,
        doc: /* Return the number of active native FSEvents streams.  */)
@@ -1822,6 +1978,29 @@ DEFUN ("fsevents--debug-stream-count", Ffsevents_debug_stream_count,
       count++;
 
   return make_fixnum (count);
+}
+
+DEFUN ("fsevents--debug-queue-counts", Ffsevents_debug_queue_counts,
+       Sfsevents_debug_queue_counts, 0, 0, 0,
+       doc: /* Return (BATCHES EVENTS OVERFLOW-MARKERS) for raw queue.  */)
+  (void)
+{
+  ptrdiff_t batches = 0;
+  ptrdiff_t overflow_markers = 0;
+  size_t events = 0;
+
+  pthread_mutex_lock (&raw_queue_mutex);
+  for (struct raw_batch *tail = raw_queue_head; tail; tail = tail->next)
+    {
+      batches++;
+      events += tail->num_events;
+      if (tail->overflow)
+        overflow_markers++;
+    }
+  pthread_mutex_unlock (&raw_queue_mutex);
+
+  return list3 (make_fixnum (batches), make_fixnum ((EMACS_INT) events),
+                make_fixnum (overflow_markers));
 }
 
 DEFUN ("fsevents--debug-enqueue-empty-batch",
@@ -1875,8 +2054,7 @@ DEFUN ("fsevents--debug-enqueue-overflow-batch",
   if (!batch)
     memory_full (SIZE_MAX);
 
-  batch->stream_id = XFIXNUM (stream_id);
-  batch->num_events = 1;
+  raw_batch_init (batch, XFIXNUM (stream_id), 1);
   batch->events = malloc (sizeof *batch->events);
   if (!batch->events)
     {
@@ -1913,8 +2091,7 @@ DEFUN ("fsevents--debug-enqueue-overflow-write-batch",
   if (!batch)
     memory_full (SIZE_MAX);
 
-  batch->stream_id = XFIXNUM (stream_id);
-  batch->num_events = 2;
+  raw_batch_init (batch, XFIXNUM (stream_id), 2);
   batch->events = malloc (sizeof *batch->events * batch->num_events);
   if (!batch->events)
     {
@@ -1963,8 +2140,7 @@ DEFUN ("fsevents--debug-enqueue-delete-batch",
   if (!batch)
     memory_full (SIZE_MAX);
 
-  batch->stream_id = XFIXNUM (stream_id);
-  batch->num_events = 1;
+  raw_batch_init (batch, XFIXNUM (stream_id), 1);
   batch->events = malloc (sizeof *batch->events);
   if (!batch->events)
     {
@@ -2000,8 +2176,7 @@ DEFUN ("fsevents--debug-enqueue-root-changed-batch",
   if (!batch)
     memory_full (SIZE_MAX);
 
-  batch->stream_id = XFIXNUM (stream_id);
-  batch->num_events = 1;
+  raw_batch_init (batch, XFIXNUM (stream_id), 1);
   batch->events = malloc (sizeof *batch->events);
   if (!batch->events)
     {
@@ -2140,8 +2315,7 @@ event, with PATH_EXISTS set from non-nil EXISTS.  */)
   struct raw_batch *batch = malloc (sizeof *batch);
   if (!batch)
     memory_full (SIZE_MAX);
-  batch->stream_id = XFIXNUM (stream_id);
-  batch->num_events = num_events;
+  raw_batch_init (batch, XFIXNUM (stream_id), num_events);
   batch->events
     = num_events ? malloc (sizeof *batch->events * num_events) : NULL;
   if (num_events && !batch->events)
@@ -2183,6 +2357,8 @@ globals_of_fsevents (void)
   stream_list = Qnil;
   next_desc = 0;
   next_stream_id = 0;
+  raw_queue_num_events = 0;
+  __atomic_store_n (&fsevents_event_queue_limit, 1024, __ATOMIC_RELEASE);
   fsevents_debug_inject_batch_during_read = false;
   fsevents_debug_inject_stream_id = -1;
   fsevents_debug_performance_counters_enabled = false;
@@ -2198,7 +2374,9 @@ syms_of_fsevents (void)
   defsubr (&Sfsevents_add_watch);
   defsubr (&Sfsevents_rm_watch);
   defsubr (&Sfsevents_valid_p);
+  defsubr (&Sfsevents_set_event_queue_limit);
   defsubr (&Sfsevents_debug_stream_count);
+  defsubr (&Sfsevents_debug_queue_counts);
   defsubr (&Sfsevents_debug_enqueue_empty_batch);
   defsubr (&Sfsevents_debug_inject_empty_batch_during_read);
   defsubr (&Sfsevents_debug_watch_stream_id);

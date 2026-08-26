@@ -25,11 +25,13 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'filenotify)
 
 (declare-function fsevents-add-watch "fsevents.m" (file flags callback))
 (declare-function fsevents-rm-watch "fsevents.m" (watch-descriptor))
 (declare-function fsevents-valid-p "fsevents.m" (watch-descriptor))
 (declare-function fsevents--debug-stream-count "fsevents.m" ())
+(declare-function fsevents--debug-queue-counts "fsevents.m" ())
 (declare-function fsevents--debug-enqueue-empty-batch "fsevents.m" (stream-id))
 (declare-function fsevents--debug-inject-empty-batch-during-read "fsevents.m" (stream-id))
 (declare-function fsevents--debug-watch-stream-id "fsevents.m" (watch-descriptor))
@@ -66,6 +68,250 @@ function instead of `sit-for'."
   (let ((deadline (+ (float-time) seconds)))
     (while (< (float-time) deadline)
       (read-event nil nil 0.05))))
+
+(ert-deftest fsevents-test-event-limit-overflow-rescans-watches ()
+  "A finite event limit emits one rescan per affected logical watch."
+  (skip-unless fsevents-tests--available)
+  (let* ((original file-notify-fsevents-event-limit)
+         (tmpdir (make-temp-file "fsevents-limit" t))
+         (testfile (expand-file-name "target.txt" tmpdir))
+         (dir-events nil)
+         (file-events nil)
+         dir-desc file-desc
+         (entries (mapcar (lambda (n)
+                            (list (expand-file-name
+                                   (format "storm-%d" n) tmpdir)
+                                  nil))
+                          (number-sequence 0 4))))
+    (write-region "content" nil testfile)
+    (unwind-protect
+        (progn
+          (customize-set-variable 'file-notify-fsevents-event-limit 4)
+          (setq dir-desc
+                (fsevents-add-watch
+                 tmpdir '(create)
+                 (lambda (ev) (push ev dir-events))))
+          (setq file-desc
+                (fsevents-add-watch
+                 testfile '(write)
+                 (lambda (ev) (push ev file-events))))
+          (should (= (fsevents--debug-watch-stream-id dir-desc)
+                     (fsevents--debug-watch-stream-id file-desc)))
+          (fsevents-tests--pump-events 0.2)
+          (setq dir-events nil file-events nil)
+          (fsevents--debug-enqueue-rename-batch
+           (fsevents--debug-watch-stream-id dir-desc) entries)
+          (should (equal '(1 0 1) (fsevents--debug-queue-counts)))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (let ((dir-summaries
+                 (cl-remove-if-not
+                  (lambda (ev)
+                    (and (equal '(create) (nth 1 ev))
+                         (equal tmpdir (nth 2 ev))))
+                  dir-events))
+                (file-summaries
+                 (cl-remove-if-not
+                  (lambda (ev)
+                    (and (equal '(write) (nth 1 ev))
+                         (equal testfile (nth 2 ev))))
+                  file-events)))
+            (should (= 1 (length dir-summaries)))
+            (should (= 1 (length file-summaries))))
+          (should (fsevents-valid-p dir-desc))
+          (should (fsevents-valid-p file-desc))
+          (should (equal '(0 0 0) (fsevents--debug-queue-counts))))
+      (when (and file-desc (fsevents-valid-p file-desc))
+        (fsevents-rm-watch file-desc))
+      (when (and dir-desc (fsevents-valid-p dir-desc))
+        (fsevents-rm-watch dir-desc))
+      (delete-directory tmpdir t)
+      (customize-set-variable 'file-notify-fsevents-event-limit original))))
+
+(ert-deftest fsevents-test-event-limit-deduplicates-markers ()
+  "Additional detail on an overloaded stream does not duplicate its marker."
+  (skip-unless fsevents-tests--available)
+  (let* ((original file-notify-fsevents-event-limit)
+         (tmpdir (make-temp-file "fsevents-limit" t))
+         (testfile (expand-file-name "target.txt" tmpdir))
+         (dir-events nil)
+         (file-events nil)
+         dir-desc file-desc
+         (entries (mapcar (lambda (n)
+                            (list (expand-file-name
+                                   (format "storm-%d" n) tmpdir)
+                                  nil))
+                          (number-sequence 0 4))))
+    (write-region "content" nil testfile)
+    (unwind-protect
+        (progn
+          (customize-set-variable 'file-notify-fsevents-event-limit 4)
+          (setq dir-desc
+                (fsevents-add-watch
+                 tmpdir '(create)
+                 (lambda (ev) (push ev dir-events))))
+          (setq file-desc
+                (fsevents-add-watch
+                 testfile '(write)
+                 (lambda (ev) (push ev file-events))))
+          (fsevents-tests--pump-events 0.2)
+          (setq dir-events nil file-events nil)
+          (setq entries
+                (mapcar (lambda (entry) (list (car entry) nil)) entries))
+          (let ((stream-id (fsevents--debug-watch-stream-id dir-desc)))
+            (fsevents--debug-enqueue-rename-batch stream-id entries)
+            (should (equal '(1 0 1) (fsevents--debug-queue-counts)))
+            (fsevents--debug-enqueue-rename-batch
+             stream-id (list (list (expand-file-name "later" tmpdir) nil)))
+            (should (equal '(1 0 1) (fsevents--debug-queue-counts))))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(create) (nth 1 ev))
+                                (equal tmpdir (nth 2 ev))))
+                         dir-events))))
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(write) (nth 1 ev))
+                                (equal testfile (nth 2 ev))))
+                         file-events))))
+          (should (equal '(0 0 0) (fsevents--debug-queue-counts))))
+      (when (and file-desc (fsevents-valid-p file-desc))
+        (fsevents-rm-watch file-desc))
+      (when (and dir-desc (fsevents-valid-p dir-desc))
+        (fsevents-rm-watch dir-desc))
+      (delete-directory tmpdir t)
+      (customize-set-variable 'file-notify-fsevents-event-limit original))))
+
+(ert-deftest fsevents-test-event-limit-isolates-streams ()
+  "Queue overflow on one native stream preserves another stream's detail."
+  (skip-unless fsevents-tests--available)
+  (let* ((original file-notify-fsevents-event-limit)
+         (busy-root (make-temp-file "fsevents-busy" t))
+         (quiet-root (make-temp-file "fsevents-quiet" t))
+         (busy-file (expand-file-name "target.txt" busy-root))
+         (quiet-file (expand-file-name "target.txt" quiet-root))
+         (busy-dir-events nil)
+         (busy-file-events nil)
+         (quiet-events nil)
+         busy-dir-desc busy-file-desc quiet-desc
+         (entries (mapcar (lambda (n)
+                            (list (expand-file-name
+                                   (format "storm-%d" n) busy-root)
+                                  nil))
+                          (number-sequence 0 4))))
+    (write-region "busy" nil busy-file)
+    (write-region "quiet" nil quiet-file)
+    (unwind-protect
+        (progn
+          (customize-set-variable 'file-notify-fsevents-event-limit 4)
+          (setq busy-dir-desc
+                (fsevents-add-watch
+                 busy-root '(create)
+                 (lambda (ev) (push ev busy-dir-events))))
+          (setq busy-file-desc
+                (fsevents-add-watch
+                 busy-file '(write)
+                 (lambda (ev) (push ev busy-file-events))))
+          (setq quiet-desc
+                (fsevents-add-watch
+                 quiet-root '(delete)
+                 (lambda (ev) (push ev quiet-events))))
+          (let ((busy-stream (fsevents--debug-watch-stream-id busy-dir-desc))
+                (quiet-stream (fsevents--debug-watch-stream-id quiet-desc)))
+            (should-not (= busy-stream quiet-stream))
+            (fsevents-tests--pump-events 0.2)
+            (setq busy-dir-events nil busy-file-events nil quiet-events nil)
+            (fsevents--debug-enqueue-rename-batch busy-stream entries)
+            (fsevents--debug-enqueue-delete-batch quiet-stream quiet-file)
+            (should (equal '(2 1 1) (fsevents--debug-queue-counts))))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(create) (nth 1 ev))
+                                (equal busy-root (nth 2 ev))))
+                         busy-dir-events))))
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(write) (nth 1 ev))
+                                (equal busy-file (nth 2 ev))))
+                         busy-file-events))))
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(delete) (nth 1 ev))
+                                (equal quiet-file (nth 2 ev))))
+                         quiet-events))))
+          (should-not (cl-some (lambda (ev) (equal '(create) (nth 1 ev)))
+                               quiet-events))
+          (should (fsevents-valid-p busy-dir-desc))
+          (should (fsevents-valid-p busy-file-desc))
+          (should (fsevents-valid-p quiet-desc))
+          (should (equal '(0 0 0) (fsevents--debug-queue-counts))))
+      (when (and quiet-desc (fsevents-valid-p quiet-desc))
+        (fsevents-rm-watch quiet-desc))
+      (when (and busy-file-desc (fsevents-valid-p busy-file-desc))
+        (fsevents-rm-watch busy-file-desc))
+      (when (and busy-dir-desc (fsevents-valid-p busy-dir-desc))
+        (fsevents-rm-watch busy-dir-desc))
+      (delete-directory busy-root t)
+      (delete-directory quiet-root t)
+      (customize-set-variable 'file-notify-fsevents-event-limit original))))
+
+(ert-deftest fsevents-test-event-limit-nil-is-lossless ()
+  "Nil preserves detailed batches while a finite limit collapses them."
+  (skip-unless fsevents-tests--available)
+  (let* ((original file-notify-fsevents-event-limit)
+         (tmpdir (make-temp-file "fsevents-limit" t))
+         (events nil)
+         desc
+         (entries (mapcar (lambda (n)
+                            (list (expand-file-name
+                                   (format "storm-%d" n) tmpdir)
+                                  nil))
+                          (number-sequence 0 4))))
+    (unwind-protect
+        (progn
+          (setq desc
+                (fsevents-add-watch
+                 tmpdir '(create delete)
+                 (lambda (ev) (push ev events))))
+          (fsevents-tests--pump-events 0.2)
+          (customize-set-variable 'file-notify-fsevents-event-limit nil)
+          (fsevents--debug-enqueue-rename-batch
+           (fsevents--debug-watch-stream-id desc) entries)
+          (should (equal '(1 5 0) (fsevents--debug-queue-counts)))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (should (equal '(0 0 0) (fsevents--debug-queue-counts)))
+          (setq events nil)
+          (should-error
+           (customize-set-variable 'file-notify-fsevents-event-limit 0))
+          (should-error
+           (customize-set-variable 'file-notify-fsevents-event-limit -1))
+          (customize-set-variable 'file-notify-fsevents-event-limit 4)
+          (fsevents--debug-enqueue-rename-batch
+           (fsevents--debug-watch-stream-id desc) entries)
+          (should (equal '(1 0 1) (fsevents--debug-queue-counts)))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (should (= 1 (length
+                        (cl-remove-if-not
+                         (lambda (ev)
+                           (and (equal '(create) (nth 1 ev))
+                                (equal tmpdir (nth 2 ev))))
+                         events))))
+          (should (equal '(0 0 0) (fsevents--debug-queue-counts))))
+      (when (and desc (fsevents-valid-p desc))
+        (fsevents-rm-watch desc))
+      (delete-directory tmpdir t)
+      (customize-set-variable 'file-notify-fsevents-event-limit original))))
 
 (ert-deftest fsevents-test-add-watch ()
   "Test that `fsevents-add-watch' returns an integer descriptor."

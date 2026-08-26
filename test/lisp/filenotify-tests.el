@@ -80,6 +80,41 @@
 (defvar file-notify--test-events nil)
 (defvar file-notify--test-monitors nil)
 
+(ert-deftest file-notify-test-fsevents-event-limit-customization ()
+  "Check FSEvents event-limit Customize metadata and validation."
+  (let ((original file-notify-fsevents-event-limit)
+        (type '(choice (const :tag "Unlimited" nil)
+                       (integer :tag "Maximum pending events"))))
+    (unwind-protect
+        (progn
+          (should (= 1024 (default-value
+                            'file-notify-fsevents-event-limit)))
+          (should
+           (equal '(file-notify-fsevents-event-limit custom-variable)
+                  (assq 'file-notify-fsevents-event-limit
+                        (get 'files 'custom-group))))
+          (should (equal type
+                         (get 'file-notify-fsevents-event-limit
+                              'custom-type)))
+          (should (eq #'file-notify--set-fsevents-event-limit
+                      (get 'file-notify-fsevents-event-limit 'custom-set)))
+          (customize-set-variable 'file-notify-fsevents-event-limit nil)
+          (should-not (default-value 'file-notify-fsevents-event-limit))
+          (when (featurep 'fsevents)
+            (customize-set-variable 'file-notify-fsevents-event-limit 1)
+            (should (= 1 (default-value
+                          'file-notify-fsevents-event-limit)))
+            (should-error
+             (customize-set-variable
+              'file-notify-fsevents-event-limit (ash 1 128)))
+            (should (= 1 (default-value
+                          'file-notify-fsevents-event-limit))))
+          (should-error
+           (customize-set-variable 'file-notify-fsevents-event-limit 0))
+          (should-error
+           (customize-set-variable 'file-notify-fsevents-event-limit -1)))
+      (customize-set-variable 'file-notify-fsevents-event-limit original))))
+
 (defun file-notify--test-wait-event ()
   "Wait for one event.
 There are different timeouts for local and remote file notification libraries."
