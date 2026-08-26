@@ -439,7 +439,9 @@ the custom setter and must not be used for live changes."
 		 (and (memq 'change flags)
 		      '(create delete write rename))
 		 (and (memq 'attribute-change flags)
-		      '(attrib)))
+		      '(attrib))
+		 (and (memq 'recursive flags)
+		      '(recursive)))
 		#'file-notify--callback-fsevents)))
     (if (file-symlink-p backend-file)
 	(puthash desc t file-notify--fsevents-symlink-descriptors)
@@ -501,11 +503,17 @@ include the following symbols:
   `change'           -- watch for file changes
   `attribute-change' -- watch for file attributes changes, like
                         permissions or modification time
+  `recursive'        -- for a directory, report events for the
+                        directory and all its descendants; supported
+                        only by the local FSEvents backend
 
 If FILE is a directory, `change' watches for file creation or
 deletion in that directory.  Some of the file notification
-backends report also file changes.  This does not work
-recursively.
+backends report also file changes.  Without `recursive', this does
+not work recursively.  With `recursive', the local FSEvents
+backend reports events for the directory and all its descendants.
+Other local backends and file name handlers do not support
+`recursive' and signal a `file-notify-error'.
 
 When any event happens, Emacs will call the CALLBACK function passing
 it a single argument EVENT, which is of the form
@@ -529,16 +537,32 @@ FILE is the name of the file whose event is being reported."
     (signal 'wrong-type-argument `(,file)))
   (setq file (expand-file-name file))
   (unless (and (consp flags)
-	       (null (delq 'change (delq 'attribute-change (copy-tree flags)))))
+	       (null (delq 'change
+		       (delq 'attribute-change
+			     (delq 'recursive (copy-tree flags))))))
     (signal 'wrong-type-argument `(,flags)))
   (unless (functionp callback)
     (signal 'wrong-type-argument `(,callback)))
 
   (let ((handler (find-file-name-handler file 'file-notify-add-watch))
-	(dir (directory-file-name
-	      (if (file-directory-p file)
-		  file
-		(file-name-directory file)))))
+	 (dir (directory-file-name
+		 (if (file-directory-p file)
+		     file
+		   (file-name-directory file))))
+	 (recursive (memq 'recursive flags)))
+    ;; Recursive watches require the local FSEvents backend.  Check
+    ;; before any file-name handler or other local backend is invoked.
+    (when (and recursive
+               (or handler (not (eq file-notify--library 'fsevents))))
+      (signal 'file-notify-error
+              '("Recursive watches require the local FSEvents backend")))
+    ;; FSEvents recursion applies only to real directory roots.  Check
+    ;; this before invoking the backend, including slash-suffixed links.
+    (when (and recursive
+               (or (not (file-directory-p file))
+                   (file-symlink-p (directory-file-name file))))
+      (signal 'file-notify-error
+              '("Recursive watches require a directory")))
 
     (unless (file-directory-p dir)
       (signal 'file-notify-error `("Directory does not exist" ,dir)))

@@ -459,6 +459,61 @@ function instead of `sit-for'."
           (fsevents-rm-watch desc)))
       (delete-directory tmpdir t))))
 
+(ert-deftest fsevents-test-recursive-directory-relevance ()
+  "Recursive directory watches receive descendant events, unlike normal ones."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (nested (expand-file-name "nested" tmpdir))
+         (deep-file (expand-file-name "deep.txt" nested))
+         (recursive-events nil)
+         (normal-events nil)
+         recursive-desc normal-desc)
+    (make-directory nested)
+    (unwind-protect
+        (progn
+          (setq recursive-desc
+                (fsevents-add-watch
+                 tmpdir '(create recursive)
+                 (lambda (ev) (push ev recursive-events))))
+          (setq normal-desc
+                (fsevents-add-watch
+                 tmpdir '(create)
+                 (lambda (ev) (push ev normal-events))))
+          (fsevents--debug-enqueue-rename-batch
+           (fsevents--debug-watch-stream-id recursive-desc)
+           (list (list deep-file t)))
+          (fsevents--debug-handle-pipe-ready)
+          (fsevents-tests--pump-events 0.5)
+          (should (cl-some (lambda (ev)
+                            (and (equal deep-file (nth 2 ev))
+                                 (memq 'create (nth 1 ev))))
+                          recursive-events))
+          (should-not (cl-some (lambda (ev) (equal deep-file (nth 2 ev)))
+                                normal-events))
+          (should-not (cl-some (lambda (ev) (memq 'recursive (nth 1 ev)))
+                                recursive-events)))
+      (when (and normal-desc (fsevents-valid-p normal-desc))
+        (fsevents-rm-watch normal-desc))
+      (when (and recursive-desc (fsevents-valid-p recursive-desc))
+        (fsevents-rm-watch recursive-desc))
+      (delete-directory tmpdir t))))
+
+(ert-deftest fsevents-test-recursive-file-watch-rejected ()
+  "Recursive watches are rejected for files and symlinks."
+  (skip-unless fsevents-tests--available)
+  (let* ((tmpdir (make-temp-file "fsevents-test" t))
+         (file (expand-file-name "file.txt" tmpdir))
+         (link (expand-file-name "link.txt" tmpdir)))
+    (write-region "content" nil file)
+    (make-symbolic-link file link)
+    (unwind-protect
+        (progn
+          (should-error (fsevents-add-watch file '(create recursive) #'ignore)
+                        :type 'file-notify-error)
+          (should-error (fsevents-add-watch link '(create recursive) #'ignore)
+                        :type 'file-notify-error))
+      (delete-directory tmpdir t))))
+
 (ert-deftest fsevents-test-file-create-event ()
   "Test that creating a file generates a `create' event."
   (skip-unless fsevents-tests--available)

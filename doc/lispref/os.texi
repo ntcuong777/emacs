@@ -3633,12 +3633,19 @@ watch for changes in file's contents
 @item attribute-change
 watch for changes in file attributes, like permissions or modification
 time
+@item recursive
+for a directory, watch the directory and all its descendants; this is
+supported only for local files by the FSEvents backend
 @end table
 
 If @var{file} is a directory, @code{change} watches for file creation
-and deletion in that directory.  Some of the native file notification
-libraries also report file changes in that case.  This does not work
-recursively.
+and deletion in that directory.  Some native file notification
+libraries also report file changes in that case.  This is not recursive.
+
+The @code{recursive} flag is supported only for local FSEvents watches
+of real directories.  Other local backends, remote file-name handlers,
+files, and symbolic links signal @code{file-notify-error} when
+@code{recursive} is requested.
 
 When any event happens, Emacs will call the @var{callback} function
 passing it a single argument @var{event}, which is of the form

@@ -4846,8 +4846,12 @@ are not added.  Set to nil for unlimited watches.")
 
 (cl-defun eglot--watch-globs (server id globs dir in-root
                                      &aux (project (eglot--project server))
+                                     (root (or dir (project-root project)))
                                      success
-                                     (watch-count (eglot--count-file-watches)))
+                                     (watch-count (eglot--count-file-watches))
+                                     (recursive-watch
+                                      (and (eq file-notify--library 'fsevents)
+                                           (not (file-remote-p root)))))
   "Set up file watching for relative file names matching GLOBS under DIR.
 GLOBS is a list of (COMPILED-GLOB . KIND) pairs, where COMPILED-GLOB is
 a compiled glob predicate and KIND is a bitmask of change types.  DIR is
@@ -4883,7 +4887,8 @@ happens to be inside or matching the project root."
               server :workspace/didChangeWatchedFiles
               `(:changes ,(vector `(:uri ,(eglot-path-to-uri file)
                                          :type ,action-type))))
-             (when (and (eq action 'created)
+             (when (and (not recursive-watch)
+                        (eq action 'created)
                         (file-directory-p file))
                (add-watch file)))
             ((eq action 'renamed)
@@ -4899,13 +4904,20 @@ not watching some directories" eglot-max-file-watches)
                 (jsonrpc-error "Reached `eglot-max-file-watches' limit of %d"
                                eglot-max-file-watches))
                (t
-                (push (file-notify-add-watch subdir '(change) #'handle-event)
+                (push (file-notify-add-watch
+                       subdir
+                       (if recursive-watch '(change recursive) '(change))
+                       #'handle-event)
                       (gethash id (eglot--file-watches server)))
                 (cl-incf watch-count)))))
-    (let ((subdirs (if (or (null dir) in-root)
-                       (subdirs-using-project)
-                     (condition-case _ (subdirs-using-find)
-                       (error (subdirs-using-project))))))
+    (let ((subdirs
+           (if recursive-watch
+               (list root)
+             (if (or (null dir) in-root)
+                 (subdirs-using-project)
+               (condition-case _
+                   (subdirs-using-find)
+                 (error (subdirs-using-project)))))))
       (unwind-protect
           (cl-loop for sd in subdirs do (add-watch sd) finally (setq success t))
         (unless success

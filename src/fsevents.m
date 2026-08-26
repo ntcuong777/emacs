@@ -29,14 +29,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "process.h"
 
 
-/* Watch list.  Each element is:
-   (DESCRIPTOR FILE DIR DIRP FLAGS CALLBACK STREAM-ID RESOLVED_DIR)
-   FILE  -- the original path passed to fsevents-add-watch (file or dir).
-   DIR   -- the original directory namespace for this logical watch.
-   DIRP  -- non-nil if FILE was originally a directory watch.
-   FLAGS -- the requested event flags list.
-   CALLBACK -- the Lisp callback function.
-   STREAM-ID -- fixnum token of the native stream serving this watch.  */
+/* Logical watch registry.  The WATCH_* accessors below document the
+   watch-object layout.  */
 static Lisp_Object watch_list;
 /* Native stream registry.  Each element is:
    (STREAM-ID STREAMREF ROOT REFCOUNT RETIRED-TO RETIRED-WATCHES)
@@ -58,15 +52,17 @@ static int fsevents_pipe[2] = { -1, -1 };
 static int next_desc;
 static int next_stream_id;
 
+
 /* Promote sibling stream roots to a shared parent stream once enough
    disjoint siblings accumulate under the same directory.  */
 enum { FSEVENTS_SIBLING_PROMOTION_THRESHOLD = 8 };
 
 /* Accessor macros for watch_object fields.
    Format: (DESC FILE DIR TYPE FLAGS CALLBACK STREAM-ID RESOLVED_DIR)
-   TYPE is Qt for directory watches, Qnil for file watches, or
-   Qsymlink for symlink-leaf watches (monitor the link entry itself,
-   suppress all events except attribute changes).
+   TYPE is Qt for normal directory watches, Qrecursive for recursive
+   directory watches, Qnil for file watches, or Qsymlink for
+   symlink-leaf watches (monitor the link entry itself, suppress all
+   events except attribute changes).
    RESOLVED_DIR holds the physical path (symlinks resolved) used for
    the FSEventStream and event filtering.  DIR holds the caller's
    original path, used for translating event paths back to the
@@ -102,6 +98,12 @@ static void fsevents_stream_callback (ConstFSEventStreamRef streamRef,
                                       const FSEventStreamEventFlags eventFlags[],
                                       const FSEventStreamEventId eventIds[]);
 static bool fsevents_path_prefix_p (Lisp_Object parent, Lisp_Object child);
+static bool fsevents_directory_watch_p (Lisp_Object watch_object);
+static bool fsevents_recursive_watch_p (Lisp_Object watch_object);
+static bool fsevents_watch_root_p (Lisp_Object watch_object,
+                                   Lisp_Object file);
+static bool fsevents_path_within_watch_root_p (Lisp_Object watch_object,
+                                                Lisp_Object event_path);
 static bool fsevents_same_path_p (Lisp_Object file1, Lisp_Object file2);
 static Lisp_Object fsevents_parent_dir (Lisp_Object dir);
 static bool fsevents_stream_active_p (Lisp_Object stream_entry);
@@ -762,16 +764,34 @@ fsevents_dispose_watch (Lisp_Object watch_object)
     fsevents_close_pipe ();
 }
 
+/* Return true if WATCH_OBJECT is a directory watch.  */
+static bool
+fsevents_directory_watch_p (Lisp_Object watch_object)
+{
+  return (CONSP (watch_object)
+          && (EQ (WATCH_TYPE (watch_object), Qt)
+              || EQ (WATCH_TYPE (watch_object), Qrecursive)));
+}
+
+/* Return true if WATCH_OBJECT is a recursive directory watch.  */
+static bool
+fsevents_recursive_watch_p (Lisp_Object watch_object)
+{
+  return (fsevents_directory_watch_p (watch_object)
+          && EQ (WATCH_TYPE (watch_object), Qrecursive));
+}
+
 /* Return true if EVENT_PATH is relevant for WATCH_OBJECT.
    For a directory watch: the event path must be the directory itself
-   or a direct child (not a deeper descendant).
+   or a direct child (not a deeper descendant), unless the watch is
+   recursive, in which case any descendant is relevant.
    For a file watch: the event path must exactly match FILE.  */
 static bool
 fsevents_path_relevant_p (Lisp_Object watch_object, Lisp_Object event_path)
 {
   Lisp_Object watched_file = WATCH_FILE (watch_object);
   Lisp_Object dir = WATCH_DIR (watch_object);
-  bool watching_dir = EQ (WATCH_TYPE (watch_object), Qt);
+  bool watching_dir = fsevents_directory_watch_p (watch_object);
   Lisp_Object encoded_watched_file = ENCODE_FILE (watched_file);
   Lisp_Object encoded_event_path = ENCODE_FILE (event_path);
   const char *watched_file_str = SSDATA (encoded_watched_file);
@@ -779,6 +799,8 @@ fsevents_path_relevant_p (Lisp_Object watch_object, Lisp_Object event_path)
 
   if (watching_dir)
     {
+      if (fsevents_recursive_watch_p (watch_object))
+        return fsevents_path_within_watch_root_p (watch_object, event_path);
       Lisp_Object encoded_dir = ENCODE_FILE (dir);
       /* DIR always ends with '/'.  Check that event_path starts with
 	 dir prefix.  */
@@ -874,7 +896,7 @@ fsevents_rename_pair_relevant_p (int descriptor, Lisp_Object old_file,
   if (fsevents_same_path_p (old_file, new_file))
     return false;
 
-  if (!EQ (WATCH_TYPE (watch_object), Qt))
+  if (!fsevents_directory_watch_p (watch_object))
     {
       if (fsevents_same_path_p (old_file, WATCH_FILE (watch_object)))
 	return true;
@@ -905,7 +927,7 @@ fsevents_path_within_watch_root_p (Lisp_Object watch_object,
   if (fsevents_watch_root_p (watch_object, event_path))
     return true;
 
-  if (!EQ (WATCH_TYPE (watch_object), Qt))
+  if (!fsevents_directory_watch_p (watch_object))
     return false;
 
   return fsevents_path_prefix_p (WATCH_DIR (watch_object),
@@ -939,7 +961,7 @@ fsevents_cross_boundary_rename_entry (int descriptor, Lisp_Object old_file,
       /* For file watches, a rename-out of the watched path is reported
 	 as rename (not delete) so the Lisp layer can continue monitoring
 	 the path after it is recreated (backup/atomic-save pattern).  */
-      if (!EQ (WATCH_TYPE (watch_object), Qt)
+      if (!fsevents_directory_watch_p (watch_object)
 	  && fsevents_same_path_p (old_file, WATCH_FILE (watch_object)))
 	return list4 (make_fixnum (descriptor),
 		      list1 (Qrename), old_file, new_file);
@@ -1424,7 +1446,7 @@ fsevents_process_raw_batch_for_watch (struct raw_batch *raw,
 					 &last_pending, &pending_by_path,
 					 &batch, file, actions,
 					 current_default_action);
-	  if (EQ (WATCH_TYPE (watch_obj), Qt)
+	  if (fsevents_directory_watch_p (watch_obj)
 	      && fsevents_path_within_watch_root_p (watch_obj, file))
 	    {
 	      /* Emit `created' on the watched directory itself.
@@ -1607,7 +1629,7 @@ fsevents_process_overflow_for_watch (Lisp_Object watch_obj)
   fsevents_debug_count_watch_dispatch ();
 
   Lisp_Object actions;
-  if (EQ (WATCH_TYPE (watch_obj), Qt))
+  if (fsevents_directory_watch_p (watch_obj))
     actions = list1 (Qcreate);
   else if (EQ (WATCH_TYPE (watch_obj), Qsymlink))
     actions = list1 (Qattrib);
@@ -1790,11 +1812,14 @@ watched for some reason, this function signals a `file-notify-error' error.
 FLAGS is a list of events to be watched for.  It can include the
 following symbols:
 
-  `create' -- FILE was created
-  `delete' -- FILE was deleted
-  `write'  -- FILE has changed
-  `attrib' -- a FILE attribute was changed
-  `rename' -- FILE was moved to FILE1
+  `create'    -- FILE was created
+  `delete'    -- FILE was deleted
+  `write'     -- FILE has changed
+  `attrib'    -- a FILE attribute was changed
+  `rename'    -- FILE was moved to FILE1
+  `recursive' -- for a directory FILE, report events for FILE and all
+                 of its descendants; this is rejected for files and
+                 symlinks with a `file-notify-error' error
 
 When any event happens, Emacs will call the CALLBACK function passing
 it a single argument EVENT, which is of the form
@@ -1808,10 +1833,14 @@ events where the file was renamed to FILE1.  */)
   (Lisp_Object file, Lisp_Object flags, Lisp_Object callback)
 {
   Lisp_Object dir, watch_type, resolved_dir;
+  bool recursive;
 
   CHECK_STRING (file);
   file = Fexpand_file_name (file, Qnil);
   file = Fdirectory_file_name (file);
+
+  CHECK_LIST (flags);
+  recursive = !NILP (Fmemq (Qrecursive, flags));
 
   /* Normalize directory arguments to their slashless form before all
      watch classification.  FSEvents reports root paths without a
@@ -1834,9 +1863,6 @@ events where the file was renamed to FILE1.  */)
     {
       watch_type = Qsymlink;
       dir = Ffile_name_directory (file);
-      if (NILP (dir) || NILP (Ffile_directory_p (dir)))
-	report_file_error ("Directory does not exist",
-			   NILP (dir) ? file : dir);
     }
   else if (!NILP (Ffile_directory_p (file)))
     {
@@ -1847,11 +1873,24 @@ events where the file was renamed to FILE1.  */)
     {
       watch_type = Qnil;
       dir = Ffile_name_directory (file);
-      if (NILP (Ffile_directory_p (dir)))
-	report_file_error ("Directory does not exist", dir);
     }
 
-  CHECK_LIST (flags);
+  if (recursive)
+    {
+      if (!EQ (watch_type, Qt))
+        xsignal2 (Qfile_notify_error,
+                  build_string ("Recursive watches require a directory"), file);
+      watch_type = Qrecursive;
+    }
+  if (EQ (watch_type, Qsymlink))
+    {
+      if (NILP (dir) || NILP (Ffile_directory_p (dir)))
+        report_file_error ("Directory does not exist",
+                          NILP (dir) ? file : dir);
+    }
+  else if (NILP (watch_type) && NILP (Ffile_directory_p (dir)))
+    report_file_error ("Directory does not exist", dir);
+
 
   if (! FUNCTIONP (callback))
     wrong_type_argument (Qinvalid_function, callback);
@@ -1889,20 +1928,20 @@ events where the file was renamed to FILE1.  */)
       fsevents_retarget_descendant_streams (stream_entry, stream_root);
     }
 
-  /* Store the logical watch.
-     Format: (DESC FILE DIR TYPE FLAGS CALLBACK STREAM-ID RESOLVED_DIR)
-     FILE and DIR use the caller's original paths; RESOLVED_DIR holds
-     the physical path for event path translation.  TYPE is Qt
-     (directory), Qnil (file), or Qsymlink (symlink leaf).  */
+  /* Store the logical watch.  FILE and DIR use the caller's original
+     paths; RESOLVED_DIR holds the physical path for event path
+     translation.  TYPE is Qt (normal directory), Qrecursive (recursive
+     directory), Qnil (file), or Qsymlink (symlink leaf).  */
   Lisp_Object watch_object
     = Fcons (watch_descriptor,
-	     Fcons (file,
-		    Fcons (dir,
-			   Fcons (watch_type,
-				  Fcons (flags,
-					 Fcons (callback,
-						list2 (STREAM_ID (stream_entry),
-						      resolved_dir)))))));
+             Fcons (file,
+                    Fcons (dir,
+                           Fcons (watch_type,
+                                  Fcons (flags,
+                                         Fcons (callback,
+                                                list2
+                                                (STREAM_ID (stream_entry),
+                                                 resolved_dir)))))));
   watch_list = Fcons (watch_object, watch_list);
 
   return watch_descriptor;
@@ -2398,6 +2437,7 @@ syms_of_fsevents (void)
   DEFSYM (Qattrib, "attrib");
   DEFSYM (Qrename, "rename");
   DEFSYM (Qstopped, "stopped");
+  DEFSYM (Qrecursive, "recursive");
 
   /* Watch types.  */
   DEFSYM (Qsymlink, "symlink");

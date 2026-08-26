@@ -114,7 +114,6 @@
           (should-error
            (customize-set-variable 'file-notify-fsevents-event-limit -1)))
       (customize-set-variable 'file-notify-fsevents-event-limit original))))
-
 (defun file-notify--test-wait-event ()
   "Wait for one event.
 There are different timeouts for local and remote file notification libraries."
@@ -399,7 +398,6 @@ smb-notify or (remote) tramp-rpc libraries; otherwise it is nil.
             (should-not (gethash desc file-notify--fsevents-symlink-descriptors))))
       (remhash desc file-notify--fsevents-symlink-descriptors)
       (remhash desc file-notify-descriptors))))
-
 (defmacro file-notify--deftest-remote (test docstring &optional unstable)
   "Define ert `TEST-remote' for remote files.
 If UNSTABLE is non-nil, the test is tagged as `:unstable'."
@@ -1940,7 +1938,6 @@ the file watch."
        (delete-directory file-notify--test-tmpdir 'recursive)
        (file-notify-rm-watch file-notify--test-desc)
        (file-notify--test-cleanup-p)))))
-
 (file-notify--deftest-remote file-notify-test12-symlinks
   "Check `file-notify-test12-symlinks' for remote files.")
 
@@ -2006,6 +2003,39 @@ the file watch."
   (if interactive
       (ert-run-tests-interactively "^file-notify-")
     (ert-run-tests-batch "^file-notify-")))
+
+(ert-deftest file-notify-test-add-watch-fsevents-forwards-recursive ()
+  "Forward `recursive' only to the FSEvents adapter for directories."
+  (let ((file-notify--library 'fsevents)
+        (file-notify-descriptors (make-hash-table :test 'equal))
+        captured)
+    (cl-letf (((symbol-function 'fsevents-add-watch)
+               (lambda (file flags _callback)
+                 (setq captured (list file flags))
+                 17)))
+      (ert-with-temp-directory dir
+        (let ((desc (file-notify-add-watch dir '(change recursive) #'ignore)))
+          (should (equal (directory-file-name dir) (car captured)))
+          (should (equal '(create delete write rename recursive)
+                         (nth 1 captured)))
+          (remhash desc file-notify-descriptors))))))
+
+(ert-deftest file-notify-test-recursive-rejects-unsupported-backends ()
+  "Reject recursive watches before invoking unsupported backends or handlers."
+  (let ((file-notify--library 'kqueue)
+        (backend-called nil))
+    (cl-letf (((symbol-function 'kqueue-add-watch)
+               (lambda (&rest _args) (setq backend-called t))))
+      (ert-with-temp-directory dir
+        (should-error (file-notify-add-watch dir '(change recursive) #'ignore)
+                      :type 'file-notify-error)
+        (should-not backend-called))))
+  (let ((file-notify--library 'fsevents))
+    (ert-with-temp-directory dir
+      (let ((file-name-handler-alist
+             `((,(concat "\\`" (regexp-quote dir)) . file-name-non-special))))
+        (should-error (file-notify-add-watch dir '(change recursive) #'ignore)
+                      :type 'file-notify-error)))))
 
 ;; TODO:
 
